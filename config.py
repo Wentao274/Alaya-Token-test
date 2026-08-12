@@ -5,6 +5,7 @@ e.g. ``ALAYA_TEST_USER_ID=10`` or ``ALAYA_REQUEST_COUNT=10``.
 """
 
 import os
+import time
 from datetime import datetime, timedelta
 
 
@@ -93,6 +94,25 @@ TPM_START_TIMESTAMP = _env_int("ALAYA_TPM_START", _DEFAULT_START)
 TPM_END_TIMESTAMP = _env_int("ALAYA_TPM_END", _DEFAULT_END)
 DAILY_COST_START_TIMESTAMP = _env_int("ALAYA_DAILY_START", _DEFAULT_START)
 DAILY_COST_END_TIMESTAMP = _env_int("ALAYA_DAILY_END", _DEFAULT_END)
+
+# Page-default window span for /api/log/ and /api/log/stat (近8天 minus 1s).
+# 8 * 24 * 3600 - 1 = 691199. Both interfaces share a single frozen ``start``
+# (= now0 - LOG_WINDOW_SPAN, captured once at the baseline) and a single frozen
+# ``end`` (= now1, captured once post-propagation); the frozen start lets the
+# baseline-delta in test_log_stat_delta cancel all pre-existing rows exactly.
+LOG_WINDOW_SPAN = 691199
+
+
+def last_24h_window():
+    """Return (start, end) unix timestamps covering the last 24h ending at now.
+
+    Matches the operation-platform page default (近24小时). ``end`` is the
+    real-time timestamp at the moment of the call, so each API request gets a
+    fresh window: start = now - 86400, end = now.
+    """
+    end = int(time.time())
+    start = end - 86400
+    return start, end
 
 
 def today_str():

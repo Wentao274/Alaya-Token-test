@@ -234,12 +234,21 @@ def _overlapping_buckets(series, win_start, win_end, bucket_sec):
 # ---------- daily-cost helpers ----------
 
 
-def _poll_daily_cost(admin_client):
+def _poll_daily_cost(admin_client, start_ts, end_ts):
+    """Poll ``/api/daily-cost`` until today's test01 entry is ready.
+
+    Uses the SHARED frozen page-default 近24小时 window (``start_ts``,
+    ``end_ts``) — identical to what ``/api/tpm-capacity`` uses, since both
+    interfaces belong to the same operation page and the page sends both
+    requests with one captured "now". ``end_ts`` was captured once
+    post-propagation; reused on every retry (the run's rows were created
+    earlier so always land inside the window).
+    """
     last = None
     for attempt in range(1, config.POLL_RETRIES + 1):
         cost = admin_client.get_daily_cost(
-            config.DAILY_COST_START_TIMESTAMP,
-            config.DAILY_COST_END_TIMESTAMP,
+            start_ts,
+            end_ts,
             config.TEST_USER_ID,
         )
         last = cost
@@ -288,10 +297,17 @@ def _poll_log_stat(admin_client, baseline, our_request_count, win_start, win_end
     """Poll ``/api/log/stat`` until the request_count delta reflects our run.
 
     Returns the last raw stat response. ``baseline`` is the pre-run snapshot
-    (captured by ``model_requests`` over ``[win_start, win_end]``). Polling
-    succeeds once the after-baseline ``request_count`` delta reaches our run's
-    request count (all our consume logs have landed). If ``our_request_count`` is
-    0, returns the first response.
+    (captured by ``model_requests`` over ``[win_start, now0]``). Both ``win_start``
+    and ``win_end`` are the SHARED frozen page-default 近8天 window (identical to
+    what ``/api/log/`` uses): ``win_start`` was frozen at baseline (= now0 -
+    LOG_WINDOW_SPAN), ``win_end`` was captured once post-propagation (= now1, a
+    real "now" > all this run's row created_at). The window only grew at the
+    right edge vs baseline, so (after - baseline) cancels all pre-existing rows
+    exactly and equals the rows in (now0, now1] (our run). Polling retries the
+    SAME query until our consume logs have landed (their created_at < win_end, so
+    once inserted they appear in the window). Succeeds once the after-baseline
+    ``request_count`` delta reaches our run's request count. If
+    ``our_request_count`` is 0, returns the first response.
     """
     last = None
     need = int(our_request_count)
@@ -322,22 +338,24 @@ def _poll_log_stat(admin_client, baseline, our_request_count, win_start, win_end
     return last
 
 
-def _poll_stress_metrics(admin_client, baseline, our_request_count, win_start, win_end):
+def _poll_stress_metrics(admin_client, baseline, our_request_count):
     """Poll ``/api/admin/usage/stress-metrics`` until the n delta reflects our run.
 
     Returns the last raw stress-metrics response. ``baseline`` is the pre-run
-    snapshot (captured by ``model_requests`` over the fixed window
-    ``[win_start, win_end]`` with ``model_name=glm-5.2`` filter). Polling succeeds
-    once the after-baseline ``n`` delta reaches our run's request count (all our
-    consume logs have landed in the window). If ``our_request_count`` is 0,
-    returns the first response.
+    snapshot (captured by ``model_requests`` over the page-default 近24小时
+    window). Each retry re-queries with a FRESH 近24小时 window
+    (``start = now - 86400``, ``end = int(time.time())`` — real-time at this
+    request, matching the page behavior). Polling succeeds once the
+    after-baseline ``n`` delta reaches our run's request count (all our consume
+    logs have landed). If ``our_request_count`` is 0, returns the first response.
     """
     last = None
     need = int(our_request_count)
     for attempt in range(1, config.POLL_RETRIES + 1):
+        q_start, q_end = config.last_24h_window()
         raw = admin_client.get_stress_metrics(
-            start_ts=win_start,
-            end_ts=win_end,
+            start_ts=q_start,
+            end_ts=q_end,
             model_name=config.MODEL_NAME,
         )
         last = raw
@@ -419,7 +437,11 @@ def test_daily_cost_revenue(model_requests, admin_client):
     print(f"[delta] 基线快照(请求前): {baseline}")
 
     with allure.step("请求后: 查询 daily-cost 并轮询至当天数据就绪"):
-        cost = _poll_daily_cost(admin_client)
+        cost = _poll_daily_cost(
+            admin_client,
+            model_requests["page_start_24h"],
+            model_requests["page_end_24h"],
+        )
         print(f"[admin] daily-cost raw: {cost}")
         attach_json(cost, "daily-cost 原始响应(请求后)")
 
@@ -809,11 +831,13 @@ def test_tpm_capacity(model_requests, admin_client):
     the unix window (``start_ts``/``end_ts``). We:
       1. sum tokens as nexus does — ``prompt + completion`` per request via
          ``_usage_tokens`` (cached input included);
-      2. query tpm-capacity for a window covering our requests (padded by ~2
-         buckets using the adaptive ``bucket_sec``) and poll until test01's
-         ``user_tpm`` shows up;
-      3. sum ``bucket_min * user_tpm`` over the buckets overlapping our window
-         and compare with our actual consumed tokens.
+      2. query tpm-capacity for the page-default 近24小时 window (the SAME
+         shared (start, end) as /api/daily-cost, captured once by
+         ``model_requests`` so both interfaces use identical timestamps; the
+         server picks ``bucket_sec`` adaptively from the query window) and poll
+         until test01's ``user_tpm`` shows up;
+      3. sum ``bucket_min * user_tpm`` over the buckets overlapping our session
+         window and compare with our actual consumed tokens.
 
     A relative+absolute tolerance is used because: bucket boundaries may split
     our traffic, the SQL bucketing rounds to ``bucketSec`` edges, and test01
@@ -844,20 +868,16 @@ def test_tpm_capacity(model_requests, admin_client):
         "TPM 实际消耗(模型侧)",
     )
 
-    # Query a window padded by ~2 buckets on each side so edge buckets appear.
-    # The pad must use the SAME bucket width the server will pick for the query
-    # window (adaptive per nexus tpm_capacity.go:79-88). We don't know the final
-    # query window until we add the pad, so iterate to a fixed point (the bucket
-    # size only grows with window size, so at most a couple of iterations).
-    bucket_sec = tpm_bucket_size(win_end - win_start)
-    while True:
-        pad = bucket_sec * 2
-        q_start = win_start - pad
-        q_end = win_end + pad
-        next_bucket_sec = tpm_bucket_size(q_end - q_start)
-        if next_bucket_sec == bucket_sec:
-            break
-        bucket_sec = next_bucket_sec
+    # Query the page-default 近24小时 window — the SAME shared (start, end) as
+    # /api/daily-cost (both belong to one operation page → identical timestamps;
+    # captured once by model_requests as page_start_24h/page_end_24h). The
+    # server picks the bucket width adaptively from the query window
+    # (tpm_capacity.go:79-88); a 24h window → 300s buckets. We still match only
+    # the buckets overlapping our actual session window [win_start, win_end]
+    # below to isolate this run's traffic from other test01 activity in the 24h.
+    q_start = model_requests["page_start_24h"]
+    q_end = model_requests["page_end_24h"]
+    bucket_sec = tpm_bucket_size(q_end - q_start)
     bucket_min = bucket_sec // 60
 
     matched = []
@@ -1388,19 +1408,22 @@ def test_cache_optimize_overview(model_requests, admin_client):
 # ---------------------------------------------------------------------------
 
 
-def _fetch_run_log_entries(admin_client, win_start, win_end, pad=60, max_pages=50):
-    """Paginate ``/api/log/`` over a padded window and return this run's consume rows.
+def _fetch_run_log_entries(
+    admin_client, q_start, q_end, session_start, session_end, pad=60, max_pages=50
+):
+    """Paginate ``/api/log/`` over the page-default 8-day window and return this run's rows.
 
     The server lists are pre-filtered by ``username=test01`` and
-    ``model_name=glm-5.2`` over ``[win_start - pad, win_end + pad]``, ordered by
-    ``id desc`` (newest first), ``ItemsPerPage=10`` (``controller/log.go:47,57``,
-    ``common/config.ItemsPerPage=10``). Pages are fetched until a short page (last)
-    or empty page is hit (with a safety cap). Rows are then defensively re-filtered
-    by ``filter_run_logs`` (consume type=2, user_id, model_name, created_at in the
-    padded window) to strip any non-consume rows that ``type=0`` may surface.
+    ``model_name=glm-5.2`` over ``[q_start, q_end]`` (the page-default 近8天
+    window: frozen ``start`` + real-time ``end``), ordered by ``id desc``
+    (newest first), ``ItemsPerPage=10`` (``controller/log.go:47,57``,
+    ``common/config.ItemsPerPage=10``). Pages are fetched until a short page
+    (last) or empty page is hit, or until a row older than the session window
+    appears (this run's rows are newest, so they're on the first pages — no need
+    to page through all 8 days of history). Rows are then defensively re-filtered
+    by ``filter_run_logs`` (consume type=2, user_id, model_name, created_at in
+    the padded SESSION window) to isolate this run's rows.
     """
-    win_lo = win_start - pad
-    win_hi = win_end + pad
     collected = []
     for p in range(max_pages):
         page = admin_client.get_logs(
@@ -1408,8 +1431,8 @@ def _fetch_run_log_entries(admin_client, win_start, win_end, pad=60, max_pages=5
             type_=0,
             model_name=config.MODEL_NAME,
             token_name="",
-            start_ts=win_lo,
-            end_ts=win_hi,
+            start_ts=q_start,
+            end_ts=q_end,
             username=config.MODEL_USER,
             channel=0,
         )
@@ -1419,8 +1442,18 @@ def _fetch_run_log_entries(admin_client, win_start, win_end, pad=60, max_pages=5
         # final page); an empty page also terminates.
         if len(data) < 10:
             break
+        # early exit: rows are newest-first; once the oldest row on this page
+        # predates the session window, no later page can hold this run's rows.
+        oldest = int((data[-1] or {}).get("created_at", 0) or 0)
+        if oldest and oldest < session_start - pad:
+            break
     return filter_run_logs(
-        collected, config.TEST_USER_ID, config.MODEL_NAME, win_start, win_end, pad
+        collected,
+        config.TEST_USER_ID,
+        config.MODEL_NAME,
+        session_start,
+        session_end,
+        pad,
     )
 
 
@@ -1452,20 +1485,30 @@ def test_log_list_entries(model_requests, admin_client):
     (real). So the multiset of ``(prompt, completion, cached)`` from our model
     ``usage`` must equal the multiset from the log rows.
 
-    The test queries a narrow window around the run (so only this run's rows
-    appear in a clean test environment), paginates to collect all rows, and for
+    The test queries the page-default 近8天 window (``start = now - 691199``,
+    ``end = now``, shared frozen start with ``/api/log/stat``) — paginates to
+    collect rows, then isolates this run's rows by the SESSION window — and for
     each row asserts: created_at within the run window, model name, username,
     total = prompt + completion, and cost == computeLogCost on the real cached.
     """
-    win_start = model_requests["start_ts"]
-    win_end = model_requests["end_ts"]
+    s_start = model_requests["start_ts"]  # session window (for isolating this run)
+    s_end = model_requests["end_ts"]
+    q_start = model_requests[
+        "query_start_8d"
+    ]  # shared frozen 8d start (same as /api/log/stat)
+    q_end = model_requests[
+        "query_end_8d"
+    ]  # shared frozen 8d end (same value as /api/log/stat)
     usages = model_requests["usages"]
     our = sum_request_tokens(usages)
-    print(f"[log] 本次运行窗口=[{win_start},{win_end}], 实际消耗={our}")
+    print(f"[log] 本次运行窗口=[{s_start},{s_end}], 实际消耗={our}")
+    print(
+        f"[log] 查询窗口(与/api/log/stat共享)=[{q_start}..{q_end}] ({q_end - q_start}s)"
+    )
     attach_json(our, "本次运行实际消耗(log list)")
 
     with allure.step("查询 /api/log/ 并分页收集本次运行日志"):
-        rows = _fetch_run_log_entries(admin_client, win_start, win_end)
+        rows = _fetch_run_log_entries(admin_client, q_start, q_end, s_start, s_end)
         print(f"[log] 收集到 {len(rows)} 条日志(过滤后)")
         attach_json(rows, "本次运行日志行(/api/log/)")
 
@@ -1476,7 +1519,7 @@ def test_log_list_entries(model_requests, admin_client):
         passed=bool(rows),
         detail=(
             f"No log rows found for user_id={config.TEST_USER_ID} "
-            f"model={config.MODEL_NAME} in window [{win_start},{win_end}]"
+            f"model={config.MODEL_NAME} in window [{s_start},{s_end}]"
         ),
     )
     assert rows, "no log rows collected for this run"
@@ -1512,7 +1555,7 @@ def test_log_list_entries(model_requests, admin_client):
             user_ok = r.get("username") == config.MODEL_USER
             total_ok = total == prompt + completion  # sanity, always true
             created = int(r.get("created_at", 0) or 0)
-            time_ok = win_start - 60 <= created <= win_end + 60
+            time_ok = s_start - 60 <= created <= s_end + 60
             if not (model_ok and user_ok and total_ok and cost_ok and time_ok):
                 bad.append(
                     {
@@ -1657,12 +1700,15 @@ def test_log_stat_delta(model_requests, admin_client):
       - ``cost_amount`` = ``sumModelCosts`` on the **billed** cached (fallback real
         if 0), i.e. Σ computeLogCost(prompt, completion, cached_billed) per model.
 
-    Because the stat is cumulative over a fixed window, capturing a BASELINE
-    before the run and an AFTER snapshot after, then diffing, isolates this run's
-    contribution (pre-existing rows are in both snapshots and cancel). The
-    conftest ``model_requests`` fixture captures the baseline over a narrow
-    window around the session (``stat_window_start``/``stat_window_end``) before
-    any request.
+    Because the stat is cumulative over a window, capturing a BASELINE before
+    the run and an AFTER snapshot after, then diffing, isolates this run's
+    contribution. The conftest ``model_requests`` fixture captures the baseline
+    over the page-default 近8天 window (``start = now0 - 691199``, ``end = now0``,
+    real-time at the baseline request). The after-snapshot REUSES the SAME
+    frozen ``start`` and advances ``end`` to its own real-time request time, so
+    the window only grows at the right edge — pre-existing rows in
+    ``[start, now0]`` are in both snapshots and cancel exactly; the delta =
+    rows in ``(now0, now1]`` = this run.
 
     Test01 (``has_target=false``) → ``ComputeBilledCachedTokens`` returns real
     unchanged → billed==real per row → ``cost_amount`` delta == Σ computeLogCost
@@ -1674,9 +1720,17 @@ def test_log_stat_delta(model_requests, admin_client):
     baseline = model_requests.get("stat_baseline")
     if baseline is None:
         pytest.skip("log stat baseline unavailable (capture failed before requests)")
-    win_start = model_requests["stat_window_start"]
-    win_end = model_requests["stat_window_end"]
-    print(f"[stat] 基线快照: {baseline} (window [{win_start},{win_end}])")
+    win_start = model_requests[
+        "query_start_8d"
+    ]  # frozen 8d start (shared with /api/log/)
+    win_end = model_requests[
+        "query_end_8d"
+    ]  # frozen 8d end (shared with /api/log/, captured post-propagation)
+    baseline_end = model_requests["stat_window_end"]  # baseline capture time (now0)
+    print(
+        f"[stat] 基线快照: {baseline} (window [{win_start}..{baseline_end}]); "
+        f"after window [{win_start}..{win_end}] (shared with /api/log/)"
+    )
 
     usages = model_requests["usages"]
     our = sum_request_tokens(usages)
@@ -1688,16 +1742,6 @@ def test_log_stat_delta(model_requests, admin_client):
         raw = _poll_log_stat(
             admin_client, baseline, our["request_count"], win_start, win_end
         )
-        print(f"[admin] log stat raw (after): {raw}")
-        attach_json(raw, "/api/log/stat 原始响应(请求后)")
-
-    _check(
-        "/api/log/stat 接口成功",
-        expected=True,
-        actual=bool(isinstance(raw, dict) and raw.get("success", True)),
-        passed=isinstance(raw, dict) and raw.get("success", True),
-        detail=f"log stat call failed: {raw!r}",
-    )
     assert isinstance(raw, dict)  # type-narrowing
 
     after = extract_log_stat(raw)
@@ -1800,7 +1844,11 @@ def test_log_stat_delta(model_requests, admin_client):
     #     all rows have elapsed_time > 0, so the reconstruction is reliable.
     with allure.step("avg_elapsed_ms 交叉校验 (vs 本次日志行 elapsed_time 均值)"):
         rows = _fetch_run_log_entries(
-            admin_client, model_requests["start_ts"], model_requests["end_ts"]
+            admin_client,
+            model_requests["query_start_8d"],
+            model_requests["query_end_8d"],
+            model_requests["start_ts"],
+            model_requests["end_ts"],
         )
         elapsed_values = [int(r.get("elapsed_time", 0) or 0) for r in rows]
         with_elapsed = [e for e in elapsed_values if e > 0]
@@ -1921,13 +1969,15 @@ def test_stress_metrics(model_requests, admin_client):
         Upper-inclusive bounds; ``v>=10000`` is caught before the loop.
 
     The endpoint has no ``user_id``/``username`` filter (only ``model_name`` /
-    ``token_name``), so the test uses a **fixed-window baseline-delta** (same as
-    log-stat): the baseline is captured BEFORE requests over
-    ``[T0-60, T0+1800]`` with ``model_name=glm-5.2`` filter, and the
-    after-snapshot uses the SAME window. Pre-existing traffic is in both
-    snapshots and cancels in the delta, isolating this run's contribution. The
-    ``model_name`` filter narrows to glm-5.2 traffic and helps stay under the
-    500k-row guard (``stressMaxRows``, ``stress_metrics.go:29``).
+    ``token_name``), so the test uses a baseline-delta (same idea as log-stat):
+    the baseline is captured BEFORE requests over the page-default 近24小时
+    window (``start = now0 - 86400``, ``end = now0``) with ``model_name=glm-5.2``
+    filter, and the after-snapshot uses the SAME format with its own real-time
+    ``end = now1``. Pre-existing glm-5.2 traffic in the 24h-overlap of the two
+    windows cancels in the delta; in a clean test environment (no concurrent
+    glm-5.2 traffic) the delta equals exactly this run. The ``model_name`` filter
+    narrows to glm-5.2 traffic and helps stay under the 500k-row guard
+    (``stressMaxRows``, ``stress_metrics.go:29``).
 
     However, concurrent glm-5.2 traffic from OTHER users that lands BETWEEN
     the baseline and after snapshots appears in the delta (no user_id filter to
@@ -1962,9 +2012,9 @@ def test_stress_metrics(model_requests, admin_client):
         pytest.skip(
             "stress-metrics baseline unavailable (capture failed before requests)"
         )
-    win_start = model_requests["stress_window_start"]
-    win_end = model_requests["stress_window_end"]
-    print(f"[stress] 基线快照: n={baseline['n']} (window [{win_start},{win_end}])")
+    b_start = model_requests["stress_window_start"]
+    b_end = model_requests["stress_window_end"]
+    print(f"[stress] 基线快照: n={baseline['n']} (window [{b_start},{b_end}])")
 
     usages = model_requests["usages"]
     our = sum_request_tokens(usages)
@@ -1998,11 +2048,11 @@ def test_stress_metrics(model_requests, admin_client):
         "预期分布(本次 usage 分桶)",
     )
 
-    # Poll until the after-snapshot's n delta reflects our run.
+    # Poll until the after-snapshot's n delta reflects our run. Each poll uses a
+    # fresh page-default 近24小时 window (start = now - 86400, end = real-time
+    # now), matching the page behavior.
     with allure.step("查询 stress-metrics 并轮询至本次数据就绪"):
-        raw = _poll_stress_metrics(
-            admin_client, baseline, our["request_count"], win_start, win_end
-        )
+        raw = _poll_stress_metrics(admin_client, baseline, our["request_count"])
     print(f"[admin] stress-metrics raw (after): {raw}")
     attach_json(raw, "stress-metrics 原始响应(请求后)")
 

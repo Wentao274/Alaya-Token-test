@@ -85,9 +85,10 @@ def model_requests(model_client, admin_client):
     """
     # ----- 请求前: 查询 daily-cost 基线快照 -----
     with allure.step("请求前: 查询 daily-cost 基线快照"):
+        dc_start, dc_end = config.last_24h_window()
         baseline_cost = admin_client.get_daily_cost(
-            config.DAILY_COST_START_TIMESTAMP,
-            config.DAILY_COST_END_TIMESTAMP,
+            dc_start,
+            dc_end,
             config.TEST_USER_ID,
         )
         baseline_entry = find_today_entry(
@@ -142,16 +143,16 @@ def model_requests(model_client, admin_client):
     # transient stat-endpoint failure must not block the session; the test skips
     # itself if the baseline is unavailable.
     stat_baseline = None
-    stat_baseline_ts = None
-    stat_window_start = None
-    stat_window_end = None
+    stat_baseline_ts = int(time.time())
+    # Page-default window (近8天 minus 1s, span=6911199): frozen ``start`` shared with
+    # /api/log/ (test_log_list_entries); ``end`` is real-time at the baseline
+    # request. The after-snapshot in test_log_stat_delta reuses the SAME frozen
+    # start and advances ``end`` to its own request time, so (after - baseline)
+    # = rows in (now0, now1] = exactly this run (pre-existing rows cancel).
+    stat_window_start = stat_baseline_ts - config.LOG_WINDOW_SPAN
+    stat_window_end = stat_baseline_ts
     try:
         with allure.step("请求前: 查询 log stat 基线快照"):
-            stat_baseline_ts = int(time.time())
-            stat_window_start = stat_baseline_ts - 60  # 60s lookback
-            stat_window_end = (
-                stat_baseline_ts + 1200
-            )  # 20min covers run + propagation + polling
             stat_raw = admin_client.get_log_stat(
                 type_=0,
                 model_name="",
@@ -180,24 +181,26 @@ def model_requests(model_client, admin_client):
     # ----- 请求前: 查询 stress-metrics 基线快照 -----
     # The stress-metrics dashboard (controller/usage.go:GetStressMetrics →
     # model/stress_metrics.go:GetStressMetrics) loads all consume rows in a
-    # fixed window into Go memory and computes summary + histograms.  The
-    # endpoint has no user_id/username filter (only model_name/token_name), so
-    # the test uses a fixed-window baseline-delta (same as log-stat): the
-    # baseline captured BEFORE requests over [T0-pad, T0+window] and the
-    # after-snapshot over the SAME window — pre-existing traffic cancels in
-    # the delta.  model_name=glm-5.2 narrows the SQL filter (also helps stay
-    # under the 500k-row guard).  Best-effort: a failure must not block the
-    # session; the test skips itself if the baseline is unavailable.
+    # window into Go memory and computes summary + histograms.  The endpoint has
+    # no user_id/username filter (only model_name/token_name), so the test uses a
+    # baseline-delta (same idea as log-stat): the baseline is captured BEFORE
+    # requests over the page-default 近24小时 window (start = now0 - 86400, end =
+    # now0) and the after-snapshot uses the SAME format with its own real-time
+    # end (now1).  Pre-existing glm-5.2 traffic in the 24h-overlap cancels in the
+    # delta.  model_name=glm-5.2 narrows the SQL filter (also helps stay under
+    # the 500k-row guard).  Best-effort: a failure must not block the session;
+    # the test skips itself if the baseline is unavailable.
     stress_baseline = None
     stress_window_start = None
     stress_window_end = None
     try:
         with allure.step("请求前: 查询 stress-metrics 基线快照"):
-            stress_baseline_ts = int(time.time())
-            stress_window_start = stress_baseline_ts - 60  # 60s lookback
-            stress_window_end = (
-                stress_baseline_ts + 1800
-            )  # 30min covers run + propagation + polling
+            # Page-default 近24小时 window: start = now - 86400, end = real-time
+            # now at the baseline request. The after-snapshot (polled in
+            # test_stress_metrics) uses the SAME format with its own real-time
+            # end, so pre-existing glm-5.2 traffic in the 24h-overlap cancels in
+            # the delta; in a clean test env the delta equals exactly this run.
+            stress_window_start, stress_window_end = config.last_24h_window()
             stress_raw = admin_client.get_stress_metrics(
                 start_ts=stress_window_start,
                 end_ts=stress_window_end,
@@ -337,6 +340,27 @@ def model_requests(model_client, admin_client):
     print(f"[admin] waiting {config.PROPAGATION_WAIT}s for usage propagation...")
     with allure.step(f"等待 {config.PROPAGATION_WAIT}s 数据落地"):
         time.sleep(config.PROPAGATION_WAIT)
+
+    # Shared query END for /api/log/ & /api/log/stat (page-default 近8天 window).
+    # Captured ONCE here (post-run + post-propagation) so both interfaces — which
+    # run as separate tests at different times — use IDENTICAL start AND end.
+    # ``start`` was frozen at baseline (= now0 - LOG_WINDOW_SPAN, shared above);
+    # ``end`` is a real "now" captured now (post-run → covers all this run's
+    # rows; their ``created_at`` is the request time, which is < this end). For
+    # test_log_stat_delta: baseline window [start, now0], after window [start,
+    # now1] with the SAME start → (after - baseline) = rows in (now0, now1] = run.
+    query_end_8d = int(time.time())
+
+    # Shared query (start, end) for /api/daily-cost & /api/tpm-capacity (same
+    # operation page → identical timestamps; page-default 近24小时 window, span
+    # = 86400). Captured ONCE here so both interfaces — which run as separate
+    # tests at different times — use the SAME start and end (mirroring how the
+    # page sends both requests with one captured "now"). ``start`` = this end
+    # - 86400; both post-run queries (daily-cost poll + tpm-capacity query)
+    # reuse these frozen values (the run's rows were created earlier so are
+    # always inside the window).
+    page_end_24h = int(time.time())
+    page_start_24h = page_end_24h - 86400
     return {
         "usages": usages,
         "request_points": request_points,
@@ -352,6 +376,10 @@ def model_requests(model_client, admin_client):
         "stat_baseline_ts": stat_baseline_ts,
         "stat_window_start": stat_window_start,
         "stat_window_end": stat_window_end,
+        "query_start_8d": stat_window_start,  # shared frozen page-default 8d start for /api/log/ & /api/log/stat
+        "query_end_8d": query_end_8d,  # shared frozen page-default 8d end (captured post-propagation)
+        "page_start_24h": page_start_24h,  # shared frozen 24h start for /api/daily-cost & /api/tpm-capacity (same page)
+        "page_end_24h": page_end_24h,  # shared frozen 24h end (same value for both interfaces)
         "stress_baseline": stress_baseline,
         "stress_window_start": stress_window_start,
         "stress_window_end": stress_window_end,
