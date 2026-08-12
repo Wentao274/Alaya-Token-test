@@ -9,7 +9,8 @@
 ```
 alaya-token-test/
 ├── requirements.txt              # 依赖：httpx、pytest、allure-pytest
-├── pytest.ini                    # pytest 配置（pythonpath=.、--alluredir）
+├── pytest.ini                    # pytest 配置（pythonpath=.、testpaths、日志）
+├── run.py                         # 运行入口：时间戳分目录 + 转发参数到 pytest
 ├── config.py                     # 全部配置项，支持 ALAYA_* 环境变量覆盖
 ├── conftest.py                   # session 级 fixture + 4 个基线快照 + Allure 报告自动生成
 ├── clients/
@@ -22,9 +23,10 @@ alaya-token-test/
 │   └── allure_utils.py           # Allure 步骤/附件/断言记录工具
 ├── tests/
 │   └── test_glm52_cache_billing.py   # 6 个断言测试
-└── reports/                      # 运行后自动生成（已 gitignore）
-    ├── allure-results/           # Allure 原始 JSON 结果
-    └── allure-report/            # Allure HTML 报告（index.html）
+└── reports/                      # 运行后自动生成（已 gitignore），每次运行一个时间戳子目录
+    └── <YYYYMMDD-HHMMSS>/        # 单次运行结果目录（run.py 自动创建）
+        ├── allure-results/       # Allure 原始 JSON 结果
+        └── allure-report/        # Allure HTML 报告（index.html）
 ```
 
 ## 安装与运行
@@ -35,24 +37,34 @@ pip install -r requirements.txt
 # 安装 Allure CLI（生成 HTML 报告所需，需 Java）
 npm install -g allure-commandline
 
-# 跑全部用例 —— 运行结束自动生成 Allure HTML 报告到 reports/allure-report/
-pytest
+# 跑全部用例 —— run.py 会按时间戳自动分目录，报告生成到
+#   reports/<YYYYMMDD-HHMMSS>/allure-report/index.html
+# 多次运行互不覆盖（每次落到独立时间戳目录）
+python run.py
 
-# 只跑单个用例
-pytest tests/test_glm52_cache_billing.py::test_daily_cost_revenue -s
-pytest tests/test_glm52_cache_billing.py::test_stress_metrics -s
+# 只跑单个用例（参数原样转发给 pytest）
+python run.py tests/test_glm52_cache_billing.py::test_daily_cost_revenue -s
+python run.py tests/test_glm52_cache_billing.py::test_stress_metrics -s
+
+# 用 -k 过滤
+python run.py -k tpm
 
 # 跳过报告自动生成（只产出原始 JSON）
-ALAYA_SKIP_ALLURE_GEN=1 pytest
+ALAYA_SKIP_ALLURE_GEN=1 python run.py
 
-# 手动重新生成 HTML 报告
-allure generate reports/allure-results -o reports/allure-report --clean
+# 自定义本次运行目录名（默认时间戳；设置后不再追加时间戳）
+ALAYA_RUN_DIR=my-run-42 python run.py
+
+# 手动重新生成 HTML 报告（替换 <run> 为实际时间戳目录）
+allure generate reports/<run>/allure-results -o reports/<run>/allure-report --clean
 
 # 本地预览报告（启动临时服务器，浏览器自动打开）
-allure serve reports/allure-results
+allure serve reports/<run>/allure-results
 ```
 
 > 运行会真实调用模型 API（产生计费）并访问内网管理平台 `10.220.75.84:8080`，请确认网络可达后再执行。`-s` 用于查看实时日志输出。
+>
+> 也可直接用 `pytest` 运行（此时需自行传 `--alluredir=<dir>`，且 `run.py` 的时间戳分目录与 `ALAYA_RUN_DIR` 同步逻辑不会生效）。
 
 ## 配置
 
@@ -78,6 +90,22 @@ allure serve reports/allure-results
 | `ALAYA_PROPAGATION_WAIT` | `120` | 所有轮次结束后等待数据落地秒数（2 分钟） |
 | `ALAYA_POLL_RETRIES` / `ALAYA_POLL_INTERVAL` | `6` / `15` | 拉取后台数据的轮询次数与间隔 |
 | `ALAYA_SKIP_ALLURE_GEN` | `0` | 设为 `1` 则跳过测试结束后的 HTML 报告自动生成 |
+| `ALAYA_RUN_DIR` | 自动时间戳 | 单次运行结果目录名（`reports/<ALAYA_RUN_DIR>/`）；设为 `my-run-42` 则用该名且不再追加时间戳 |
+
+> 接口时间窗口已改为页面默认口径，不再使用 `ALAYA_TPM_START/END`、`ALAYA_DAILY_START/END` 等静态窗口变量（`config.py` 中保留定义但测试不再引用）。
+
+### 接口时间窗口口径
+
+各后台接口的时间窗口均与运营平台页面默认一致：
+
+| 接口 | 窗口口径 | start / end 来源 |
+|---|---|---|
+| `daily-cost` + `tpm-capacity` | 近24小时，同一页面共享相同 start/end | `conftest` 在落地等待后捕获一次 `now1`：`page_start_24h = now1 − 86400`，`page_end_24h = now1`；两接口所有查询（含轮询）复用这一对值 |
+| `log list` + `log stat` | 近8天减1秒（`LOG_WINDOW_SPAN = 691199`），同一页面共享相同 start/end | `conftest` 基线时冻结一次 `start = now0 − 691199`；落地等待后捕获一次 `end = now1`；两接口复用这一对值（`query_start_8d` / `query_end_8d`） |
+| `stress-metrics` | 近24小时，每次请求实时 `now` | 基线与轮询各调 `config.last_24h_window()`，`start = end − 86400`，`end = int(time.time())` |
+| `cache-optimize overview` | 无时间窗口参数 | 月度+小时聚合 |
+
+> **设计要点**：同一页面共享一对 `start`/`end` 是因为页面发出请求时只用一个捕获的 `now`；`log stat` 采用基线-增量法，冻结 `start`、推进 `end`，使 `(after − baseline)` 精确抵消窗口内既有流量，仅剩本次运行贡献。
 
 ## 测试流程
 
@@ -85,12 +113,14 @@ allure serve reports/allure-results
 
 ### 1. 请求前捕获 4 个基线快照（best-effort，失败不阻塞）
 
-| 基线 | 接口 | 窗口 | 捕获内容 |
+| 基线 | 接口 | 窗口（页面默认口径） | 捕获内容 |
 |---|---|---|---|
-| daily-cost | `GET /api/log/daily-cost` | 配置的 `DAILY_COST_START/END`（覆盖今天） | `{uncached, cached, completion, amount}` |
+| daily-cost | `GET /api/log/daily-cost` | 近24小时实时：`config.last_24h_window()`（start=now−86400, end=now） | `{uncached, cached, completion, amount}` |
 | cache-opt overview | `GET /api/admin/usage/cache-optimize/overview` | 无参（月+小时聚合） | `{month_prompt, month_real, month_billed, real_rate, billed_rate, hour_*, ctr_granted, ...}` |
-| log-stat | `GET /api/log/stat` | `[T0-60, T0+1200]` username=test01 | `{request_count, prompt, completion, cost_amount, avg_elapsed_ms}` |
-| stress-metrics | `GET /api/admin/usage/stress-metrics` | `[T0-60, T0+1800]` model_name=glm-5.2 | `{n, intok_total, outtok_total, in_hist_counts, out_hist_counts, ...}` |
+| log-stat | `GET /api/log/stat` | 近8天减1秒（`LOG_WINDOW_SPAN=691199`）：`start=now0−691199`（冻结）, `end=now0` | `{request_count, prompt, completion, cost_amount, avg_elapsed_ms}` |
+| stress-metrics | `GET /api/admin/usage/stress-metrics` | 近24小时实时：`config.last_24h_window()`，`model_name=glm-5.2` | `{n, intok_total, outtok_total, in_hist_counts, out_hist_counts, ...}` |
+
+> daily-cost 与 log-stat 的**请求前基线**用各自页面默认窗口实时取 `end`；log-stat 的 `start` 在基线时冻结，落地后复用同一 `start`、推进 `end`，使增量精确隔离本次运行。
 
 ### 2. 发起 2 轮 × 10 次模型请求
 
@@ -98,9 +128,14 @@ allure serve reports/allure-results
 - 轮间等待 `INTER_ROUND_WAIT=120s` 验证缓存跨轮持久化
 - 每条请求记录完成时刻 unix 时间戳与 `usage` 用量
 
-### 3. 等待数据落地
+### 3. 等待数据落地并捕获共享时间窗口
 
-所有轮次结束后等待 `PROPAGATION_WAIT=120s`（2 分钟），再返回 fixture，6 个测试开始各自轮询接口。
+所有轮次结束后等待 `PROPAGATION_WAIT=120s`（2 分钟），随后捕获本次会话剩余的共享时间窗口：
+
+- **`query_end_8d`** = `int(time.time())`（此刻），与基线冻结的 `query_start_8d` 配对 → 供 `/api/log/` 与 `/api/log/stat` 共享
+- **`page_end_24h`** = `int(time.time())`，`page_start_24h = page_end_24h − 86400` → 供 `/api/daily-cost` 与 `/api/tpm-capacity` 共享
+
+这些窗口随 fixture 返回给 6 个测试，确保同一页面的两个接口使用完全相同的 `start`/`end` 时间戳。
 
 ### 4. 运营后台登录
 
@@ -198,10 +233,10 @@ test01 billed==real，三条路径数值一致。
 
 | 步骤 | 方法 | 说明 |
 |---|---|---|
-| 查询 | `GET /api/admin/usage/tpm-capacity?user_id=10&start=..&end=..` | 窗口=请求窗口±2 桶 |
-| 轮询 | 至 `matched` 桶 `user_tpm>0` | — |
-| 桶宽 | `tpm_bucket_size(q_end−q_start)` | ≤6h→60s, ≤2d→300s, else→3600s（`tpm_capacity.go:79-88`） |
-| 匹配 | `_overlapping_buckets(series, win_start, win_end, bucket_sec)` | 桶 `[t, t+bucket_sec)` 与请求窗口相交 |
+| 查询 | `GET /api/admin/usage/tpm-capacity?user_id=10&start=..&end=..` | 窗口=`page_start_24h`..`page_end_24h`（与 daily-cost 共享的近24小时） |
+| 轮询 | 至 `matched` 桶 `user_tpm>0` | 复用同一对 start/end |
+| 桶宽 | `tpm_bucket_size(q_end−q_start)` | 24h 窗口 → 300s（`tpm_capacity.go:79-88`） |
+| 匹配 | `_overlapping_buckets(series, win_start, win_end, bucket_sec)` | 桶 `[t, t+bucket_sec)` 与**会话窗口** `[start_ts, end_ts]` 相交（隔离本次运行流量） |
 | 汇总 | `reported_tokens = Σ bucket_min × user_tpm` | `bucket_min = bucket_sec/60` |
 
 #### 预期数据
@@ -292,9 +327,9 @@ test01 无优化 → billed==real → `granted=0` 每请求 → `ctr_granted` �
 
 | 步骤 | 方法 | 说明 |
 |---|---|---|
-| 分页查询 | `GET /api/log/?p=0&type=0&model_name=glm-5.2&username=test01&start_ts&end_ts` | `ItemsPerPage=10`，`ORDER BY id desc` |
-| 翻页 | 至短页（`len(data)<10`）或 `max_pages=50` | — |
-| 过滤 | `filter_run_logs(collected, 10, "glm-5.2", win_start, win_end, pad=60)` | type=2, user_id=10, model_name, created_at 在 `[win−60, win+60]` |
+| 分页查询 | `GET /api/log/?p=0&type=0&model_name=glm-5.2&username=test01&start_ts&end_ts` | `start_ts=query_start_8d`、`end_ts=query_end_8d`（与 `/api/log/stat` 共享的近8天窗口）；`ItemsPerPage=10`，`ORDER BY id desc` |
+| 翻页 | 至短页（`len(data)<10`）或 `max_pages=50`，或最旧行 `created_at < 会话窗口下界` 时提前终止 | 避免翻遍8天历史 |
+| 过滤 | `filter_run_logs(collected, 10, "glm-5.2", s_start, s_end, pad=60)` | 按**会话窗口** `[start_ts, end_ts]`（±60s）隔离本次运行，type=2, user_id=10, model_name |
 
 每行字段：`{id, created_at, model_name, username, prompt_tokens, completion_tokens, cached_tokens, cost, ...}`
 
@@ -324,11 +359,11 @@ test01 无优化 → billed==real → `granted=0` 每请求 → `ctr_granted` �
 
 | 步骤 | 方法 | 说明 |
 |---|---|---|
-| 轮询 | `_poll_log_stat` → `GET /api/log/stat?type=0&username=test01&start_ts&end_ts` | 至 `delta request_count ≥ 20` |
+| 轮询 | `_poll_log_stat` → `GET /api/log/stat?type=0&username=test01&start_ts&end_ts` | 至 `delta request_count ≥ 20`；`start=query_start_8d`（冻结）、`end=query_end_8d`（与 `/api/log/` 共享） |
 | 提取 | `after = extract_log_stat(raw)` | `{request_count, prompt_tokens, completion_tokens, quota, avg_elapsed_ms, avg_ttft_ms, cost_amount}` |
 | 增量 | `delta = delta_log_stat(after, baseline)` | avg 重建：`(after.avg×after.count − before.avg×before.count) / delta.count` |
 
-窗口固定 `[T0−60, T0+1200]`（baseline 和 after 相同），既有流量在两次中都在，差值抵消。
+窗口为页面默认近8天减1秒（`LOG_WINDOW_SPAN=691199`）：基线 `[now0−691199, now0]`，after 复用**同一冻结 start**、推进 `end` 至 `query_end_8d`。既有流量在 `[start, now0]` 段两快照都在、抵消，增量 = `(now0, query_end_8d]` 的本次运行。
 
 #### 预期数据
 
@@ -360,11 +395,11 @@ test01 无优化 → billed==real → `granted=0` 每请求 → `ctr_granted` �
 
 | 步骤 | 方法 | 说明 |
 |---|---|---|
-| 轮询 | `_poll_stress_metrics` → `GET /api/admin/usage/stress-metrics?start_ts&end_ts&model_name=glm-5.2` | 至 `delta n ≥ 20` |
+| 轮询 | `_poll_stress_metrics` → `GET /api/admin/usage/stress-metrics?start_ts&end_ts&model_name=glm-5.2` | 至 `delta n ≥ 20`；每次轮询实时 `config.last_24h_window()`（start=now−86400, end=now） |
 | 提取 | `after = extract_stress_snapshot(raw)` | `{n, intok_total, outtok_total, intok_max, outtok_max, in_hist_counts[9], out_hist_counts[9], peak_conc, lat_avg, lat_max}` |
-| 增量 | `delta_n = after.n − baseline.n`<br>`delta_in_hist = delta_hist_counts(after.in_hist_counts, baseline.in_hist_counts)`<br>`delta_out_hist = 同理` | 固定窗口，既有流量抵消 |
+| 增量 | `delta_n = after.n − baseline.n`<br>`delta_in_hist = delta_hist_counts(after.in_hist_counts, baseline.in_hist_counts)`<br>`delta_out_hist = 同理` | 近24小时窗口，窗口交集中的既有 glm-5.2 流量抵消 |
 
-窗口固定 `[T0−60, T0+1800]`，`model_name=glm-5.2` 过滤（无 user_id 参数）。
+窗口为页面默认近24小时实时窗口（`start = end − 86400`，`end = int(time.time())`），`model_name=glm-5.2` 过滤（无 user_id 参数）。基线与轮询各自取实时 `end`，两次窗口的交集中既有流量抵消。
 
 #### 直方图桶边界
 
@@ -431,28 +466,34 @@ test01 无优化 → billed==real → `granted=0` 每请求 → `ctr_granted` �
   └─────────────────────┘
              │ usage(prompt/completion/cached tokens) + 时间戳
              ▼
-    conftest.model_requests  ──────────────────────────────┐
-             │                                              │
-             │ 等待 PROPAGATION_WAIT=120s 数据落地             │
-             ▼                                              ▼
-  GET /api/user/login (root)        6 个断言测试读取
-             │ Set-Cookie: session=..           │
-             ▼                                  │
-       admin_client (复用 Cookie)               │
-             │                                  │
-  ┌──────────┼──────────────────────────┐       │
-  │          │                          │       │
-  ▼          ▼                          ▼       ▼
- daily-cost  tpm-capacity          log list   stress-metrics
- cache-optimize overview          log stat
+     conftest.model_requests  ──────────────────────────────┐
+              │                                              │
+              │ 等待 PROPAGATION_WAIT=120s 数据落地             │
+              │  → 捕获共享窗口:                                 │
+              │    page_start_24h / page_end_24h  (daily-cost + tpm)
+              │    query_end_8d (与基线冻结的 query_start_8d 配对, log list + log stat)
+              ▼                                              ▼
+   GET /api/user/login (root)        6 个断言测试读取 (含上述共享窗口)
+              │ Set-Cookie: session=..           │
+              ▼                                  │
+        admin_client (复用 Cookie)               │
+              │                                  │
+   ┌──────────┼──────────────────────────┐       │
+   │          │                          │       │
+   ▼          ▼                          ▼       ▼
+  daily-cost  tpm-capacity          log list   stress-metrics
+  (共享24h)   (共享24h)            (共享8d)   (实时24h)
+  cache-optimize overview          log stat
+                                  (共享8d)
 ```
 
 ## Allure 测试报告
 
-每次执行 `pytest` 会自动：
+每次执行 `python run.py` 会自动：
 
-1. **记录原始结果**到 `reports/allure-results/`（由 `pytest.ini` 的 `--alluredir` 配置）；
-2. **生成 HTML 报告**到 `reports/allure-report/index.html`（由 `conftest.py` 的 session 级 fixture `generate_allure_report` 在全部用例结束后调用 `allure generate`）。
+1. **创建本次运行目录** `reports/<YYYYMMDD-HHMMSS>/`（默认时间戳，可用 `ALAYA_RUN_DIR` 自定义），多次运行互不覆盖；
+2. **记录原始结果**到 `reports/<run>/allure-results/`（由 `run.py` 动态传 `--alluredir`）；
+3. **生成 HTML 报告**到 `reports/<run>/allure-report/index.html`（由 `conftest.py` 的 session 级 fixture `generate_allure_report` 在全部用例结束后调用 `allure generate`，通过 `ALAYA_RUN_DIR` 与 `run.py` 解析到同一目录）。
 
 报告里记录的内容：
 
@@ -482,18 +523,18 @@ test01 无优化 → billed==real → `granted=0` 每请求 → `ctr_granted` �
 ### 查看 HTML 报告
 
 ```bash
-# 方式一：直接打开静态文件
-reports/allure-report/index.html
+# 方式一：直接打开静态文件（替换 <run> 为实际时间戳目录）
+reports/<run>/allure-report/index.html
 
 # 方式二：启动本地服务器预览（实时刷新）
-allure serve reports/allure-results
+allure serve reports/<run>/allure-results
 ```
 
 报告支持按 Feature/Story 分组、按 severity 筛选，断言步骤树形展开，附件可点开查看完整 JSON。
 
 ## 常见问题
 
-- **TPM 测试报 `reported_tokens=0`**：后台数据未落地或查询窗口未覆盖请求时刻。调大 `ALAYA_PROPAGATION_WAIT` 与 `ALAYA_POLL_INTERVAL`，或用 `ALAYA_TPM_START/END` 显式指定覆盖请求时刻的窗口。
+- **TPM 测试报 `reported_tokens=0`**：后台数据未落地或查询窗口未覆盖请求时刻。调大 `ALAYA_PROPAGATION_WAIT` 与 `ALAYA_POLL_INTERVAL`。TPM 查询窗口现为近24小时实时（与 daily-cost 共享），覆盖请求时刻；若仍为 0 多为落地延迟。
 - **daily-cost 增量对不上**：① baseline 与 after 之间 test01 有其它流量混入；② 数据落地延迟超过等待时间（调大 `ALAYA_PROPAGATION_WAIT`/轮询参数）。增量法已隔离本次贡献，正常应精确匹配容差内。
 - **daily-cost 找不到当天记录**：多为落地延迟；轮询机制会自动重试，仍失败则调大轮询参数。注意 baseline 在请求前查询，若当天尚无记录则基线为 0（合法，delta 退化为 after）。
 - **cache-opt overview 小时增量跳过**：baseline 与 after 跨了北京自然小时边界时 `hour_*` 窗口翻转，测试自动跳过小时增量校验（属预期行为，非失败）。
@@ -503,7 +544,7 @@ allure serve reports/allure-results
 - **后台接口 401**：Cookie 失效或登录失败，检查 `ALAYA_ADMIN_*` 配置及后台可达性。
 - **缓存未命中**：确认同次运行内多次请求的 `system` 内容完全一致、`temperature=0`；注意每次运行前缀带唯一 `run-tag`，因此跨运行的缓存不会复用（这是设计使然：每次运行都独立验证"填缓存+命中"流程）。
 - **多次测试会互相影响吗**：不同运行因 `run-tag` 不同，使用不同缓存 key，互不干扰，每次都从冷缓存独立验证。同一运行内：第 1 轮第 1 次填缓存，其余命中；第 2 轮是否命中取决于缓存 TTL 是否 ≥ `INTER_ROUND_WAIT`（默认 120 秒）。
-- **报告未自动生成**：未安装 `allure` CLI（`npm i -g allure-commandline`，需 Java）。此时原始 JSON 仍会生成到 `reports/allure-results/`，可手动执行 `allure generate reports/allure-results -o reports/allure-report --clean`。设置 `ALAYA_SKIP_ALLURE_GEN=1` 可彻底跳过生成步骤。
+- **报告未自动生成**：未安装 `allure` CLI（`npm i -g allure-commandline`，需 Java）。此时原始 JSON 仍会生成到 `reports/<run>/allure-results/`，可手动执行 `allure generate reports/<run>/allure-results -o reports/<run>/allure-report --clean`。设置 `ALAYA_SKIP_ALLURE_GEN=1` 可彻底跳过生成步骤。
 
 ## 注意事项
 

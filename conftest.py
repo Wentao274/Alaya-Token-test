@@ -12,8 +12,12 @@ Allure integration:
 * Each model request is recorded as a step with its usage + raw response.
 * The admin login is recorded.
 * ``generate_allure_report`` (autouse, session) builds the HTML report into
-  ``reports/allure-report`` after the whole session finishes, using the
+  ``reports/<run>/allure-report`` after the whole session finishes, using the
   allure CLI. Set ``ALAYA_SKIP_ALLURE_GEN=1`` to skip generation.
+* Per-run isolation: ``run.py`` computes a timestamped run dir
+  (``reports/<YYYYMMDD-HHMMSS>``) and passes ``--alluredir`` dynamically plus the
+  ``ALAYA_RUN_DIR`` env var so conftest resolves the SAME dir for HTML
+  generation. Override the dir name with ``ALAYA_RUN_DIR=<name>``.
 """
 
 import os
@@ -41,6 +45,15 @@ from report.allure_utils import env_info, record_model_call
 
 ALLURE_RESULTS_DIR = os.path.join("reports", "allure-results")
 ALLURE_REPORT_DIR = os.path.join("reports", "allure-report")
+
+# Per-run isolation: when run.py sets ALAYA_RUN_DIR, place results & report
+# under reports/<ALAYA_RUN_DIR>/ so each run is kept separately (not
+# overwritten). run.py passes --alluredir=<that path>/allure-results to pytest
+# AND exports ALAYA_RUN_DIR so conftest can resolve the matching report dir.
+_RUN_DIR = os.environ.get("ALAYA_RUN_DIR", "").strip()
+if _RUN_DIR:
+    ALLURE_RESULTS_DIR = os.path.join("reports", _RUN_DIR, "allure-results")
+    ALLURE_REPORT_DIR = os.path.join("reports", _RUN_DIR, "allure-report")
 
 
 @pytest.fixture(scope="session")
@@ -144,7 +157,7 @@ def model_requests(model_client, admin_client):
     # itself if the baseline is unavailable.
     stat_baseline = None
     stat_baseline_ts = int(time.time())
-    # Page-default window (近8天 minus 1s, span=6911199): frozen ``start`` shared with
+    # Page-default window (近8天 minus 1s, span=691199): frozen ``start`` shared with
     # /api/log/ (test_log_list_entries); ``end`` is real-time at the baseline
     # request. The after-snapshot in test_log_stat_delta reuses the SAME frozen
     # start and advances ``end`` to its own request time, so (after - baseline)
@@ -390,22 +403,24 @@ def model_requests(model_client, admin_client):
 def generate_allure_report(request):
     """Auto-build the Allure HTML report after the session ends.
 
-    Raw JSON results are written to ``reports/allure-results`` by pytest's
-    ``--alluredir``. This fixture runs ``allure generate`` once the session is
-    done to produce ``reports/allure-report/index.html``.
+    Raw JSON results are written to ``ALLURE_RESULTS_DIR`` by pytest's
+    ``--alluredir`` (set dynamically by ``run.py`` to a timestamped per-run
+    dir, or ``reports/allure-results`` when running pytest directly). This
+    fixture runs ``allure generate`` once the session is done to produce
+    ``ALLURE_REPORT_DIR/index.html``.
     """
     yield
     if os.environ.get("ALAYA_SKIP_ALLURE_GEN") == "1":
         print("[allure] ALAYA_SKIP_ALLURE_GEN=1, skipping HTML report generation")
         return
     if not shutil.which("allure"):
-        print("[allure] allure CLI not found; raw results in reports/allure-results")
+        print(f"[allure] allure CLI not found; raw results in {ALLURE_RESULTS_DIR}")
         print(
             "[allure] install it (`npm i -g allure-commandline`) then run: "
-            "allure generate reports/allure-results -o reports/allure-report --clean"
+            f"allure generate {ALLURE_RESULTS_DIR} -o {ALLURE_REPORT_DIR} --clean"
         )
         return
-    os.makedirs("reports", exist_ok=True)
+    os.makedirs(os.path.dirname(ALLURE_REPORT_DIR) or "reports", exist_ok=True)
     allure_bin = shutil.which("allure")
     cmd = [
         allure_bin or "allure",
