@@ -47,17 +47,51 @@ PRICE_CACHED = _env_float("ALAYA_PRICE_CACHED", 2.0)  # cached input
 PRICE_OUTPUT = _env_float("ALAYA_PRICE_OUTPUT", 28.0)  # completion
 
 # ---------- Test behavior ----------
-# Each run executes ROUND_COUNT rounds of REQUEST_COUNT requests; the first
-# request of a round fills the prompt cache, the rest hit it. Rounds are
-# separated by INTER_ROUND_WAIT (tests cache persistence across the gap).
-REQUEST_COUNT = _env_int("ALAYA_REQUEST_COUNT", 10)  # requests per round
-ROUND_COUNT = _env_int("ALAYA_ROUND_COUNT", 2)  # rounds per run
+# Each run executes ROUND_COUNT rounds of REQUEST_COUNT long-context requests
+# (rounds 1-2) plus a ROUND3_COUNT round of short independent requests (round 3).
+# Rounds 1-2: a FIXED system prefix (PREFIX_TOKENS, cached → cache hits after
+# request #1) plus a variable tail (after the prefix, always uncached) so total
+# prompt_tokens falls in one of INPUT_BUCKET_TARGETS, spreading requests across
+# stress-metrics in_hist buckets. Rounds are separated by INTER_ROUND_WAIT;
+# round 2 → 3 by ROUND2_TO_ROUND3_WAIT.
+REQUEST_COUNT = _env_int("ALAYA_REQUEST_COUNT", 10)  # long-context requests per round
+ROUND_COUNT = _env_int("ALAYA_ROUND_COUNT", 2)  # long-context rounds per run
 INTER_ROUND_WAIT = _env_int(
     "ALAYA_INTER_ROUND_WAIT", 120
-)  # wait between rounds (seconds); 0 only after the last round
-PREFIX_TOKENS = _env_int("ALAYA_PREFIX_TOKENS", 3000)  # long-context prefix length
-MAX_TOKENS = _env_int("ALAYA_MAX_TOKENS", 64)  # short completions (cheap)
+)  # wait between long-context rounds (seconds)
+MAX_TOKENS = _env_int("ALAYA_MAX_TOKENS", 64)  # short completions (rounds 1-2)
 REQUEST_PACING = _env_float("ALAYA_REQUEST_PACING", 1.0)  # seconds between model calls
+
+# Fixed system prefix (rounds 1-2): byte-identical across all requests with the
+# same run-tag → request #1 fills the prompt cache, the rest hit it (cache-hit
+# tests rely on this). The tail (in the user message, after the prefix) varies
+# per request to cover multiple input buckets.
+PREFIX_TOKENS = _env_int("ALAYA_PREFIX_TOKENS", 3000)  # long-context prefix length
+
+# Input bucket targets for rounds 1-2: (label, lo, hi) total prompt range.
+# Each request is randomly assigned a bucket; the tail length is chosen so
+# total prompt_tokens ≈ [lo, hi] (tail = target - PREFIX_TOKENS). Boundaries
+# avoid the exact inputBucket edges (1000/5000/10000/20000/50000/100000) so
+# tokenizer jitter doesn't spill into an adjacent bucket. Maps to stress-metrics
+# in_hist buckets 3-7 (1k-5k .. 50k-100k).
+INPUT_BUCKET_TARGETS = [
+    ("1k-5k", 2000, 4500),
+    ("5k-10k", 5500, 9500),
+    ("10k-20k", 11000, 19000),
+    ("20k-50k", 22000, 48000),
+    ("50k-100k", 55000, 95000),
+]
+
+# Round 3: short independent requests (no shared prefix). Each request uses a
+# random-length user-only message (no system prefix) with random max_tokens, so
+# both input (1-1k) and output (1-1k) vary; rounds-1-2's long-context cache
+# mechanism does not apply here.
+ROUND3_COUNT = _env_int("ALAYA_ROUND3_COUNT", 10)
+ROUND3_MIN_INPUT_TOKENS = _env_int("ALAYA_ROUND3_MIN_INPUT_TOKENS", 1)
+ROUND3_MAX_INPUT_TOKENS = _env_int("ALAYA_ROUND3_MAX_INPUT_TOKENS", 900)
+ROUND3_MIN_OUTPUT_TOKENS = _env_int("ALAYA_ROUND3_MIN_OUTPUT_TOKENS", 1)
+ROUND3_MAX_OUTPUT_TOKENS = _env_int("ALAYA_ROUND3_MAX_OUTPUT_TOKENS", 1000)
+ROUND2_TO_ROUND3_WAIT = _env_int("ALAYA_ROUND2_TO_ROUND3_WAIT", 120)
 # A unique tag embedded in the prefix so each run uses different content (each
 # run independently fills then hits cache) and is distinguishable in the data.
 # Empty -> auto-generate from the start time.

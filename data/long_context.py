@@ -1,9 +1,16 @@
-"""Generate a long, fixed context prefix to maximise prompt-cache hits.
+"""Generate a long, fixed context prefix plus a variable-length uncached tail.
 
-The returned string is byte-identical on every call, so sending it repeatedly
-as the leading part of the prompt makes request #1 populate the cache and all
-following requests reuse it (cached input tokens).
+``build_long_context`` returns a byte-identical string on every call, so
+sending it repeatedly as the ``system`` message makes request #1 populate the
+prompt cache and all following requests reuse it (cached input tokens).
+
+``build_variable_tail`` returns a string of roughly ``approx_tokens`` tokens;
+it is appended to the ``user`` message (after the cached system prefix) so it
+is always uncached, making the total prompt length vary per request without
+breaking cache-hit semantics.
 """
+
+import random
 
 _BASE_SECTION = (
     "上下文缓存（Prompt Cache）是大模型推理服务降本增效的关键技术之一。"
@@ -35,3 +42,42 @@ def build_long_context(approx_tokens=3000, tag=""):
     if tag:
         return f"[run-tag:{tag}]\n\n{body}"
     return body
+
+
+def build_variable_tail(approx_tokens=0, seed=""):
+    """Build a variable-length uncached tail of roughly ``approx_tokens`` tokens.
+
+    The tail is meant to be appended to the ``user`` message, AFTER the fixed
+    ``system`` prefix. Because prompt caching caches the leading prefix (the
+    system message), the tail — which lives in the user message — is never
+    cached regardless of its content. Making ``approx_tokens`` vary per request
+    therefore varies the total ``prompt_tokens`` (prefix + user) without
+    affecting the cached portion, preserving cache-hit semantics.
+
+    For Chinese text ~2 characters per token, so we target that many characters
+    by repeating the base section (granularity ~150 tokens per section).
+    ``approx_tokens <= 0`` returns an empty string (no tail). ``seed`` is
+    prepended as a short unique marker so each request's tail is byte-distinct
+    (prevents any accidental cross-request caching of the user message and makes
+    individual requests distinguishable in logs).
+    """
+    if approx_tokens <= 0:
+        return ""
+    target_chars = approx_tokens * 2
+    section = _BASE_SECTION
+    repeats = max(1, (target_chars + len(section) - 1) // len(section))
+    body = "\n\n".join([section] * repeats)
+    if seed:
+        return f"[tail:{seed}]\n\n{body}"
+    return body
+
+
+def random_tail_tokens(min_tokens=0, max_tokens=2000):
+    """Return a random target tail length in [min_tokens, max_tokens].
+
+    Uses ``min``/``max`` to clamp so the result is always a valid int in range
+    even if the caller passes a reversed or equal pair.
+    """
+    lo = min(min_tokens, max_tokens)
+    hi = max(min_tokens, max_tokens)
+    return random.randint(lo, hi)

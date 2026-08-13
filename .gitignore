@@ -3,6 +3,9 @@ __pycache__/
 *.py[codz]
 *$py.class
 
+# Windows reserved device-name files (e.g. accidentally created `nul`)
+nul
+
 # C extensions
 *.so
 

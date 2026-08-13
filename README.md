@@ -1,6 +1,6 @@
 # GLM-5.2 缓存命中与计费自动化测试
 
-以用户 `test01` 对 `glm-5.2` 模型发起长上下文请求，触发并命中 Prompt Cache，再通过运营管理后台接口核对 **每日收入**、**TPM 用量**、**缓存命中率优化**、**日志查询**、**压测指标** 六个维度，自动断言缓存生效、计费公式正确、用量数据一致。
+以用户 `test01` 对 `glm-5.2` 模型发起变长上下文请求（第 1-2 轮固定 3k 前缀 + 变长尾巴覆盖 5 个输入桶以命中 Prompt Cache；第 3 轮短上下文请求不缓存），再通过运营管理后台接口核对 **每日收入**、**TPM 用量**、**缓存命中率优化**、**日志查询**、**压测指标** 六个维度，自动断言缓存生效、计费公式正确、用量数据一致。
 
 所有断言均以 nexus `releases/xb01` 分支源码为口径基准，行号引用于各测试 docstring 与注释中。
 
@@ -17,7 +17,7 @@ alaya-token-test/
 │   ├── admin_client.py           # 运营后台：登录 + tpm-capacity/daily-cost/cache-optimize/log/stat/stress-metrics
 │   └── model_client.py           # 模型侧：OpenAI 兼容 /v1/chat/completions
 ├── data/
-│   ├── long_context.py           # 生成固定长前缀（~3000 token），用于命中缓存
+│   ├── long_context.py           # 生成固定3k前缀(缓存) + 变长尾巴(分桶) + 第3轮短消息
 │   └── metrics.py                # 共享指标工具: 基线/增量、请求用量汇总、收入公式、直方图分桶
 ├── report/
 │   └── allure_utils.py           # Allure 步骤/附件/断言记录工具
@@ -80,18 +80,24 @@ allure serve reports/<run>/allure-results
 | `ALAYA_ADMIN_USERNAME` / `ALAYA_ADMIN_PASSWORD` | `root` / `tEscuYb3aDp_OWwhU4` | 后台登录账号 |
 | `ALAYA_TEST_USER_ID` | `10` | test01 在后台的用户 id |
 | `ALAYA_PRICE_INPUT` / `ALAYA_PRICE_CACHED` / `ALAYA_PRICE_OUTPUT` | `8.0` / `2.0` / `28.0` | glm-5.2 单价（元/百万 token） |
-| `ALAYA_REQUEST_COUNT` | `10` | 每轮请求数（第 1 次填充缓存，其余命中） |
-| `ALAYA_ROUND_COUNT` | `2` | 每次运行执行的轮数（默认 2 轮共 20 次请求） |
-| `ALAYA_INTER_ROUND_WAIT` | `120` | 轮次间隔秒数（验证缓存跨轮持久化） |
+| `ALAYA_REQUEST_COUNT` | `10` | 第 1-2 轮每轮请求数（长上下文，桶分配） |
+| `ALAYA_ROUND_COUNT` | `2` | 长上下文轮数（默认 2 轮） |
+| `ALAYA_INTER_ROUND_WAIT` | `120` | 第 1-2 轮间隔秒数 |
+| `ALAYA_ROUND2_TO_ROUND3_WAIT` | `120` | 第 2 轮结束后、第 3 轮前的等待秒数 |
+| `ALAYA_ROUND3_COUNT` | `10` | 第 3 轮请求数（短上下文，不缓存） |
+| `ALAYA_ROUND3_MIN_INPUT_TOKENS` / `ALAYA_ROUND3_MAX_INPUT_TOKENS` | `1` / `900` | 第 3 轮每请求输入 token 随机范围 |
+| `ALAYA_ROUND3_MIN_OUTPUT_TOKENS` / `ALAYA_ROUND3_MAX_OUTPUT_TOKENS` | `1` / `1000` | 第 3 轮每请求 `max_tokens` 随机范围（输出 1-1k） |
 | `ALAYA_RUN_TAG` | 自动生成 | 嵌入前缀的唯一运行标记，区分不同运行；留空则按时间自动生成 |
-| `ALAYA_PREFIX_TOKENS` | `3000` | 长前缀目标 token 数 |
-| `ALAYA_MAX_TOKENS` | `64` | 单次补全上限（控制成本） |
+| `ALAYA_RUN_TAG` | 自动生成 | 嵌入前缀的唯一运行标记，区分不同运行；留空则按时间自动生成 |
+| `ALAYA_PREFIX_TOKENS` | `3000` | 固定 system 前缀 token 数（缓存命中） |
+| `ALAYA_MAX_TOKENS` | `64` | 第 1-2 轮单次补全上限（控制成本） |
 | `ALAYA_REQUEST_PACING` | `1.0` | 请求间隔秒数 |
-| `ALAYA_PROPAGATION_WAIT` | `120` | 所有轮次结束后等待数据落地秒数（2 分钟） |
+| `ALAYA_PROPAGATION_WAIT` | `120` | 所有轮次结束后等待数据落地秒数 |
 | `ALAYA_POLL_RETRIES` / `ALAYA_POLL_INTERVAL` | `6` / `15` | 拉取后台数据的轮询次数与间隔 |
 | `ALAYA_SKIP_ALLURE_GEN` | `0` | 设为 `1` 则跳过测试结束后的 HTML 报告自动生成 |
 | `ALAYA_RUN_DIR` | 自动时间戳 | 单次运行结果目录名（`reports/<ALAYA_RUN_DIR>/`）；设为 `my-run-42` 则用该名且不再追加时间戳 |
 
+> 第 1-2 轮 20 个请求通过 `INPUT_BUCKET_TARGETS`（`config.py` 中定义，默认覆盖 stress-metrics 输入桶 `1k-5k`/`5k-10k`/`10k-20k`/`20k-50k`/`50k-100k` 五档）均匀随机分配，每请求的 system 前缀固定 3k（可缓存）+ user 尾巴随机变长（`tail = 桶目标 − 3k`，未缓存），使总 `prompt_tokens` 落在目标桶内。桶边界避开 `inputBucket` 精确分界点以防分词抖动溢桶。
 > 接口时间窗口已改为页面默认口径，不再使用 `ALAYA_TPM_START/END`、`ALAYA_DAILY_START/END` 等静态窗口变量（`config.py` 中保留定义但测试不再引用）。
 
 ### 接口时间窗口口径
@@ -102,10 +108,10 @@ allure serve reports/<run>/allure-results
 |---|---|---|
 | `daily-cost` + `tpm-capacity` | 近24小时，同一页面共享相同 start/end | `conftest` 在落地等待后捕获一次 `now1`：`page_start_24h = now1 − 86400`，`page_end_24h = now1`；两接口所有查询（含轮询）复用这一对值 |
 | `log list` + `log stat` | 近8天减1秒（`LOG_WINDOW_SPAN = 691199`），同一页面共享相同 start/end | `conftest` 基线时冻结一次 `start = now0 − 691199`；落地等待后捕获一次 `end = now1`；两接口复用这一对值（`query_start_8d` / `query_end_8d`） |
-| `stress-metrics` | 近24小时，每次请求实时 `now` | 基线与轮询各调 `config.last_24h_window()`，`start = end − 86400`，`end = int(time.time())` |
+| `stress-metrics` | 近24小时，**冻结** start、推进 end | `conftest` 基线时冻结 `stress_window_start = now0 − 86400`；落地等待后捕获一次 `stress_query_end = now1`；after 快照复用冻结 start、推进 end（与 log-stat 同构） |
 | `cache-optimize overview` | 无时间窗口参数 | 月度+小时聚合 |
 
-> **设计要点**：同一页面共享一对 `start`/`end` 是因为页面发出请求时只用一个捕获的 `now`；`log stat` 采用基线-增量法，冻结 `start`、推进 `end`，使 `(after − baseline)` 精确抵消窗口内既有流量，仅剩本次运行贡献。
+> **设计要点**：同一页面共享一对 `start`/`end` 是因为页面发出请求时只用一个捕获的 `now`；`log stat` / `stress-metrics` 采用基线-增量法，冻结 `start`、推进 `end`，使 `(after − baseline)` 精确抵消窗口内既有流量，仅剩本次运行贡献。**stress-metrics 此前用实时滑动窗口导致 ~24h 前的历史流量从 after 窗口滑出污染 delta（曾出现 `delta_n=13<20` 故障），现已修复为冻结 start 模式**（与 log-stat 同构）。
 
 ## 测试流程
 
@@ -120,13 +126,27 @@ allure serve reports/<run>/allure-results
 | log-stat | `GET /api/log/stat` | 近8天减1秒（`LOG_WINDOW_SPAN=691199`）：`start=now0−691199`（冻结）, `end=now0` | `{request_count, prompt, completion, cost_amount, avg_elapsed_ms}` |
 | stress-metrics | `GET /api/admin/usage/stress-metrics` | 近24小时实时：`config.last_24h_window()`，`model_name=glm-5.2` | `{n, intok_total, outtok_total, in_hist_counts, out_hist_counts, ...}` |
 
-> daily-cost 与 log-stat 的**请求前基线**用各自页面默认窗口实时取 `end`；log-stat 的 `start` 在基线时冻结，落地后复用同一 `start`、推进 `end`，使增量精确隔离本次运行。
+> daily-cost 与 log-stat 的**请求前基线**用各自页面默认窗口实时取 `end`；log-stat 的 `start` 在基线时冻结，落地后复用同一 `start`、推进 `end`，使增量精确隔离本次运行。stress-metrics 同理冻结 `start`（见下"窗口口径"）。
 
-### 2. 发起 2 轮 × 10 次模型请求
+### 2. 发起 3 轮模型请求
 
-- 每轮第 1 次填充缓存（`prompt_tokens_details=None`），第 2~10 次命中（`cached_tokens=3712`）
+#### 第 1-2 轮：长上下文请求（可缓存）
+
+- 每轮 `REQUEST_COUNT=10` 次，共 20 次
+- **固定 system 前缀**（`PREFIX_TOKENS=3000`，带唯一 `run-tag`）→ 同次运行内所有请求前缀一致 → 第 1 次填充缓存，其余命中
+- **变长 user 尾巴**：20 个请求按 `INPUT_BUCKET_TARGETS` 均匀分配到 5 个输入桶（`1k-5k`/`5k-10k`/`10k-20k`/`20k-50k`/`50k-100k`），每桶 ~4 个；尾巴长度 = 桶目标 − 前缀，使总 `prompt_tokens` 落在目标桶内
 - 轮间等待 `INTER_ROUND_WAIT=120s` 验证缓存跨轮持久化
-- 每条请求记录完成时刻 unix 时间戳与 `usage` 用量
+- `max_tokens=64`（控制输出成本）
+
+#### 第 2 → 3 轮间隔
+
+- 等待 `ROUND2_TO_ROUND3_WAIT=120s`
+
+#### 第 3 轮：短上下文请求（不缓存）
+
+- `ROUND3_COUNT=10` 次，无 system 前缀（纯 user 消息）
+- 每请求输入长度随机 `1-900` token，`max_tokens` 随机 `1-1000` → 输入/输出均在 1-1k 变化
+- 覆盖 stress-metrics 输出直方图的多个小桶
 
 ### 3. 等待数据落地并捕获共享时间窗口
 
@@ -134,6 +154,7 @@ allure serve reports/<run>/allure-results
 
 - **`query_end_8d`** = `int(time.time())`（此刻），与基线冻结的 `query_start_8d` 配对 → 供 `/api/log/` 与 `/api/log/stat` 共享
 - **`page_end_24h`** = `int(time.time())`，`page_start_24h = page_end_24h − 86400` → 供 `/api/daily-cost` 与 `/api/tpm-capacity` 共享
+- **`stress_query_end`** = `int(time.time())`，与基线冻结的 `stress_window_start` 配对 → 供 `/api/admin/usage/stress-metrics` after 快照
 
 这些窗口随 fixture 返回给 6 个测试，确保同一页面的两个接口使用完全相同的 `start`/`end` 时间戳。
 
@@ -143,23 +164,20 @@ allure serve reports/<run>/allure-results
 
 ## 本次请求实际数据汇总
 
-以一次典型运行（2 轮 × 10 次）为例，`sum_request_tokens(usages)` 汇总：
+`sum_request_tokens(usages)` 汇总全部 30 个请求（2 轮长上下文 + 1 轮短上下文）的 `usage`：
 
-| 请求 | prompt | completion | cached |
-|---|---|---|---|
-| R1#1（填充） | 3745 | 64 | 0（None） |
-| R1#2-10（9 次命中） | 3745×9 | 64×9 | 3712×9 |
-| R2#1（部分命中） | 3745 | 64 | 320 |
-| R2#2-10（9 次命中） | 3745×9 | 64×9 | 3712×9 |
-
-| 汇总字段 | 值 | 说明 |
+| 字段 | 计算 | 说明 |
 |---|---|---|
-| `total_input` | **74900** | Σ prompt_tokens（全 prompt，含 cached） |
-| `cached_input` | **67136** | Σ cached_of（billed 口径，test01 billed==real） |
-| `uncached_input` | **7764** | total − cached |
-| `completion` | **1280** | Σ completion_tokens |
-| `total_tokens` | **76180** | prompt + completion（nexus `helper.go:237`） |
-| `request_count` | **20** | 2 轮 × 10 次 |
+| `total_input` | Σ `prompt_tokens` | 全 prompt（含 cached），跨 5 个输入桶 + 第 3 轮短请求 |
+| `cached_input` | Σ `cached_of(u)`（**billed** 口径） | 仅第 1-2 轮长前缀命中部分；第 3 轮无前缀 → cached=0 |
+| `uncached_input` | max(total − cached, 0) | 未命中部分（含第 3 轮全部输入） |
+| `completion` | Σ `completion_tokens` | 第 1-2 轮 `max_tokens=64`；第 3 轮随机 1-1k |
+| `total_tokens` | total_input + completion | nexus `helper.go:237` |
+| `request_count` | len(usages) = 30 | 2×10 + 10 |
+
+> 由于请求长度随机变化（5 桶 + 第 3 轮短请求），各字段的**每次运行值不同**；断言用容差区间而非固定值。具体值见 Allure 报告附件「本次运行实际消耗」。
+
+> **缓存命中说明**：第 1-2 轮固定 3k 前缀 → 第 1 次填充、后续命中（`cached` 随命中次数线性增长）。因尾巴变长，同桶内相同 tail 长度才命中缓存；不同 tail length 视前缀缓存续接长度而定，多数请求仍命中前缀部分。第 3 轮无 system 前缀 → 完全不命中（`cached=0`）。
 
 ## 核心口径概念
 
@@ -216,7 +234,7 @@ test01 billed==real，三条路径数值一致。
 | A3 | total==prompt+completion | `our.total_tokens == total_input+completion` | 精确 |
 | **B1（强）** | delta prompt == 本次输入 | `delta(uncached+cached) == our.total_input` | max(1000, 2%) |
 | **B2（强）** | delta completion == 本次输出 | `delta.completion == our.completion` | max(1000, 2%) |
-| C1（参考） | delta cached ≈ 本次 cached | `delta.cached ≈ our.cached` | max(2000, 15%)，优化开启时软断言 |
+| C1（参考） | delta cached ≈ 本次 cached | `delta.cached ≈ our.cached` | max(2000, 15%)（优化开启时容差说明仍可见） |
 | C2（参考） | delta uncached ≈ 本次 uncached | 同上 | 同上 |
 | **D（强）** | **接口自洽** | `delta.amount == computeLogCost(delta_uncached_real, delta_cached_real, delta_completion, 8, 2, 28)` | 0.01 |
 | E | glm-5.2 在模型清单 | `models` 含 `model_name=="glm-5.2"` | — |
@@ -225,7 +243,8 @@ test01 billed==real，三条路径数值一致。
 | H | 聚合 amount == Σ 模型 | `agg.amount == Σ m.amount`（或 `Σ computeLogCost` 全 priced 时） | 0.01 |
 | I | 仅 glm-5.2 时聚合公式 | `agg.amount == computeLogCost(agg_tokens, 8, 2, 28)` | 0.01 |
 
-**口径关键**：daily-cost `amount` 用 **real cached**（`controller/log.go:582`），`our.cached` 是 **billed**。test01 无优化时 billed==real，所以 C 组也精确相等。
+> **断言强度澄清**：C1/C2 名为"软断言"但实际经 `_delta_check` → `_check`(`raise_on_fail=True`)，**是硬断言**；它的放松机制是更宽的容差（15%）而非跳过。真正不阻塞的软诊断仅 `record_assertion(passed=True)` 调用（如诊断块、跨小时跳过说明）。
+> **口径关键**：daily-cost `amount` 用 **real cached**（`controller/log.go:582`），`our.cached` 是 **billed**。test01 无优化时 billed==real，所以 C 组也精确相等。
 
 ### 2. `test_tpm_capacity` — TPM 容量
 
@@ -385,9 +404,11 @@ test01 无优化 → billed==real → `granted=0` 每请求 → `ctr_granted` �
 | C | `delta completion_tokens == 1280` | Σ completion | max(100, 1%) |
 | D | `delta (prompt+completion) == 76180` | total | max(100, 1%) |
 | E | `delta cost_amount == our_total_cost` | sumModelCosts (billed==real) | max(1e-6, 2%) |
-| F | `delta quota == 0`（诊断） | 订阅模式 quota=0 | — |
+| F | `delta quota == 0`（**软诊断，不阻塞**） | 订阅模式 quota=0；plan 依赖故仅记录 | — |
 | G | `delta avg_elapsed_ms ≈ log_rows mean(elapsed_time)` | 重建 vs 日志均值 | max(500, 25%) |
 | G2 | `delta avg_elapsed_ms > 0` | 服务端有耗时 | — |
+
+> **断言强度**：A-G2 中除 F（quota）外均为硬断言。F 用 `record_assertion`（默认 `raise_on_fail=False`）记录但不阻塞，因订阅模式假设与 plan 配置相关，避免过度约束。
 
 ### 6. `test_stress_metrics` — 压测指标（输入/输出 token 分布）
 
@@ -395,11 +416,11 @@ test01 无优化 → billed==real → `granted=0` 每请求 → `ctr_granted` �
 
 | 步骤 | 方法 | 说明 |
 |---|---|---|
-| 轮询 | `_poll_stress_metrics` → `GET /api/admin/usage/stress-metrics?start_ts&end_ts&model_name=glm-5.2` | 至 `delta n ≥ 20`；每次轮询实时 `config.last_24h_window()`（start=now−86400, end=now） |
-| 提取 | `after = extract_stress_snapshot(raw)` | `{n, intok_total, outtok_total, intok_max, outtok_max, in_hist_counts[9], out_hist_counts[9], peak_conc, lat_avg, lat_max}` |
-| 增量 | `delta_n = after.n − baseline.n`<br>`delta_in_hist = delta_hist_counts(after.in_hist_counts, baseline.in_hist_counts)`<br>`delta_out_hist = 同理` | 近24小时窗口，窗口交集中的既有 glm-5.2 流量抵消 |
+| 轮询 | `_poll_stress_metrics` → `GET /api/admin/usage/stress-metrics?start_ts&end_ts&model_name=glm-5.2` | 至 `delta n ≥ 本次请求数`；**冻结窗口**：`start = stress_window_start`（基线时冻结 = now0−86400）、`end = stress_query_end`（落地后冻结 = now1），轮询复用同一对 |
+| 提取 | `after = extract_stress_snapshot(raw)` | `{n, intok_total, outtok_total, intok_max, outtok_max, in_hist_counts[9], out_hist_counts[9], in_hist_labels[9], out_hist_labels[9], peak_conc, lat_avg, lat_max}` |
+| 增量 | `delta_n = after.n − baseline.n`<br>`delta_in_hist = delta_hist_counts(after.in_hist_counts, baseline.in_hist_counts)`<br>`delta_out_hist = 同理` | **冻结 start** → 既有 glm-5.2 流量在窗口交集中抵消，增量 = 本次运行 |
 
-窗口为页面默认近24小时实时窗口（`start = end − 86400`，`end = int(time.time())`），`model_name=glm-5.2` 过滤（无 user_id 参数）。基线与轮询各自取实时 `end`，两次窗口的交集中既有流量抵消。
+窗口为冻结模式（基线 `[now0−86400, now0]`，after `[now0−86400, now1]`，**共享 start**），与 log-stat 同构。此前用实时滑动窗口导致 ~24h 前流量从 after 滑出污染 delta（`delta_n=13<20` 故障），已修复。
 
 #### 直方图桶边界
 
@@ -411,16 +432,16 @@ test01 无优化 → billed==real → `granted=0` 每请求 → `ctr_granted` �
 
 #### 预期数据
 
-| 字段 | 来源 | 计算 | 值 |
-|---|---|---|---|
-| `our_prompts` | `[u.prompt_tokens for u in usages]` | 20 个 3745 | [3745]×20 |
-| `our_completions` | `[u.completion_tokens for u in usages]` | 20 个 64 | [64]×20 |
-| `expected_in` | `expected_hist_counts(our_prompts, input_bucket, 9)` | `input_bucket(3745)`: 3745≤5000→桶3(1k-5k) | `[0,0,0,20,0,0,0,0,0]` |
-| `expected_out` | `expected_hist_counts(our_completions, output_bucket, 9)` | `output_bucket(64)`: 64≤100→桶2(32-100) | `[0,0,20,0,0,0,0,0,0]` |
-| `our_max_prompt` | `max(our_prompts)` | — | 3745 |
-| `our_max_completion` | `max(our_completions)` | — | 64 |
-| `our.total_input` | Σ prompt | — | 74900 |
-| `our.completion` | Σ completion | — | 1280 |
+因本次请求**长度随机变化**，每次运行的直方图分布不同；expected 由测试**实时从 `usages` 本地分桶**计算：
+
+| 字段 | 来源 | 计算 |
+|---|---|---|
+| `our_prompts` | `[u.prompt_tokens for u in usages]` | 30 个变长值（5 桶 + 短请求） |
+| `our_completions` | `[u.completion_tokens for u in usages]` | 第 1-2 轮 64；第 3 轮随机 1-1k |
+| `expected_in` | `expected_hist_counts(our_prompts, input_bucket, 9)` | 复刻 Go `stress_metrics.go:169-170` |
+| `expected_out` | `expected_hist_counts(our_completions, output_bucket, 9)` | 同上 |
+| `our_max_prompt` | `max(our_prompts)` | — |
+| `our_max_completion` | `max(our_completions)` | — |
 
 #### 断言逻辑
 
@@ -430,61 +451,67 @@ test01 无优化 → billed==real → `granted=0` 每请求 → `ctr_granted` �
 - **并发环境**（`surplus > 0`）：A-E 改为下界/子集校验（我们的请求是增量的子集，`delta >= 本次值`）
 - **F/G/H 始终精确**（自洽性和 max 聚合在任何环境下都成立）
 
-| # | 干净环境（精确） | 并发环境（下界/子集） | 比较 |
-|---|---|---|---|
-| A | `delta n == 20` | `delta n >= 20` | COUNT |
-| B | `delta intok_total == 74900` | `delta intok_total >= 74900` | Σ prompt |
-| C | `delta outtok_total == 1280` | `delta outtok_total >= 1280` | Σ completion |
-| **D** | **`delta in_hist == [0,0,0,20,0,0,0,0,0]`** | **逐桶 `delta in_hist[i] >= expected[i]`** | 逐桶子集 |
-| **E** | **`delta out_hist == [0,0,20,0,0,0,0,0,0]`** | **逐桶 `delta out_hist[i] >= expected[i]`** | 逐桶子集 |
-| F1 | `Σ delta in_hist == delta n` | 同左 | 精确（始终） |
-| F2 | `Σ delta out_hist == delta n` | 同左 | 精确（始终） |
-| G | `after intok_max >= max(baseline, 3745)` | 同左 | max 聚合（始终） |
-| H | `after outtok_max >= max(baseline, 64)` | 同左 | max 聚合（始终） |
+| # | 断言 | 干净环境（精确） | 并发环境（下界/子集） | 容差 |
+|---|---|---|---|---|
+| **schema** | `after in_hist.labels == IN_HIST_LABELS` | 硬断言 | 同左 | 精确 |
+| **schema** | `after out_hist.labels == OUT_HIST_LABELS` | 硬断言 | 同左 | 精确 |
+| **schema** | `after/baseline in_hist.counts 桶数 == 9` | 硬断言 | 同左 | 精确 |
+| **schema** | `after/baseline out_hist.counts 桶数 == 9` | 硬断言 | 同左 | 精确 |
+| A | `delta n == 本次请求数` | `==` | `>=` | 0 / — |
+| B | `delta intok_total == 本次 prompt` | `==` | `>=` | max(100, 1%) / — |
+| C | `delta outtok_total == 本次 completion` | `==` | `>=` | max(100, 1%) / — |
+| **D** | `delta in_hist.counts` 逐桶 | `== expected[i]` | `>= expected[i]` | 精确 / 子集 |
+| **E** | `delta out_hist.counts` 逐桶 | `== expected[i]` | `>= expected[i]` | 精确 / 子集 |
+| F1 | `Σ delta in_hist == delta n` | 精确 | 同左 | 始终精确 |
+| F2 | `Σ delta out_hist == delta n` | 精确 | 同左 | 始终精确 |
+| G | `after intok_max >= max(baseline, our_max_prompt)` | 硬断言 | 同左 | 始终精确 |
+| H | `after outtok_max >= max(baseline, our_max_completion)` | 硬断言 | 同左 | 始终精确 |
 
+> **schema 守卫（新增）**：在 delta 计算前对 after/baseline 的 `in_hist.labels`/`out_hist.labels` 与硬编码常量做精确相等断言，并校验 counts 桶数 == 9。防后端改 label 字符串或桶数导致后续 `zip(IN_HIST_LABELS, delta_in_hist)` 静默错位误判通过。`peak_conc`/`lat_avg`/`lat_max` 仅记录进诊断汇总（无断言）。
 > **为什么并发时用下界？** 固定窗口基线-增量法中，基线前已存在的行在两个快照中抵消。但基线与 after 之间**新落地**的并发 glm-5.2 请求（来自其他用户）会出现在增量中。我们的请求是增量的**子集**，故 `delta >= 本次值` 恒成立（token 非负）。精确匹配仅在无并发时可用。
 
 ## 总览表
 
 | 测试 | 接口 | 实际数据 | 预期数据 | 核心断言 |
 |---|---|---|---|---|
-| 1 daily-cost | `/api/log/daily-cost` | today 行的 `uncached/cached/completion/amount` | `sum_request_tokens(usages)` 74900/67136/7764/1280 | delta==本次 + amount 公式自洽(real cached) |
-| 2 tpm-capacity | `/api/admin/usage/tpm-capacity` | `Σ bucket_min×user_tpm` | `Σ (prompt+completion)=76180` | actual≈reported (25%) |
+| 1 daily-cost | `/api/log/daily-cost` | today 行的 `uncached/cached/completion/amount` | `sum_request_tokens(usages)`（动态值） | delta==本次 + amount 公式自洽(real cached) |
+| 2 tpm-capacity | `/api/admin/usage/tpm-capacity` | `Σ bucket_min×user_tpm` | `Σ (prompt+completion)`（动态值） | actual≈reported (25%) |
 | 3 cache-opt overview | `/api/admin/usage/cache-optimize/overview` | `month_*/hour_*/ctr_granted` | `our.total_input/cached_input` + baseline | billed==real, ctr_granted==0, delta==本次 |
 | 4 log list | `/api/log/` | 逐行 `{prompt,completion,cached,cost}` | `sig(u)=(prompt,completion,cached_of(u))` | 多集合一致 + 逐行 cost |
-| 5 log stat | `/api/log/stat` | `delta(request_count,prompt,completion,cost_amount)` | `our(20/74900/1280/total_cost)` | delta==本次 + avg 交叉校验 |
-| 6 stress-metrics | `/api/admin/usage/stress-metrics` | `delta n/intok/outtok + in_hist/out_hist` | `expected_hist_counts(prompts/completions)` | 干净=**分布精确匹配**; 并发=**下界/子集校验** + F/G/H 始终精确 |
+| 5 log stat | `/api/log/stat` | `delta(request_count,prompt,completion,cost_amount)` | `our(30/dynamic/dynamic/total_cost)` | delta==本次 + avg 交叉校验 |
+| 6 stress-metrics | `/api/admin/usage/stress-metrics` | `delta n/intok/outtok + in_hist/out_hist` | `expected_hist_counts(prompts/completions)`（实时分桶） | **schema 守卫 + 干净=分布精确; 并发=下界/子集 + F/G/H 始终精确** |
 
 ## 数据流图
 
 ```
        test01 (api-key)
-             │ POST /v1/chat/completions  (2轮×10次, 相同长前缀)
+             │ POST /v1/chat/completions  (2轮×10变长请求[5桶] + 第3轮10短请求)
              ▼
-  ┌─────────────────────┐
-  │  glm-5.2 模型服务    │  → 每轮第1次填 cache，第2~10次命中
-  └─────────────────────┘
+   ┌─────────────────────┐
+   │  glm-5.2 模型服务    │  第1-2轮: 固定3k前缀→缓存命中; 第3轮: 无前缀→不缓存
+   └─────────────────────┘
              │ usage(prompt/completion/cached tokens) + 时间戳
              ▼
      conftest.model_requests  ──────────────────────────────┐
-              │                                              │
-              │ 等待 PROPAGATION_WAIT=120s 数据落地             │
-              │  → 捕获共享窗口:                                 │
-              │    page_start_24h / page_end_24h  (daily-cost + tpm)
-              │    query_end_8d (与基线冻结的 query_start_8d 配对, log list + log stat)
-              ▼                                              ▼
-   GET /api/user/login (root)        6 个断言测试读取 (含上述共享窗口)
-              │ Set-Cookie: session=..           │
-              ▼                                  │
-        admin_client (复用 Cookie)               │
-              │                                  │
-   ┌──────────┼──────────────────────────┐       │
-   │          │                          │       │
-   ▼          ▼                          ▼       ▼
-  daily-cost  tpm-capacity          log list   stress-metrics
-  (共享24h)   (共享24h)            (共享8d)   (实时24h)
-  cache-optimize overview          log stat
-                                  (共享8d)
+               │                                              │
+               │ 等待 PROPAGATION_WAIT=120s 数据落地             │
+               │  → 捕获共享冻结窗口:                            │
+               │    page_start_24h / page_end_24h  (daily-cost + tpm)
+               │    query_end_8d (与基线冻结的 query_start_8d 配对, log list + log stat)
+               │    stress_query_end (与基线冻结的 stress_window_start 配对, stress-metrics)
+               ▼                                              ▼
+    GET /api/user/login (root)        6 个断言测试读取 (含上述共享窗口)
+               │ Set-Cookie: session=..           │
+               ▼                                  │
+         admin_client (复用 Cookie)               │
+               │                                  │
+    ┌──────────┼──────────────────────────┐       │
+    │          │                          │       │
+    ▼          ▼                          ▼       ▼
+   daily-cost  tpm-capacity          log list   stress-metrics
+   (共享24h)   (共享24h)            (共享8d)   (冻结24h)
+   cache-optimize overview          log stat
+                                   (共享8d)
 ```
 
 ## Allure 测试报告
@@ -540,15 +567,17 @@ allure serve reports/<run>/allure-results
 - **cache-opt overview 小时增量跳过**：baseline 与 after 跨了北京自然小时边界时 `hour_*` 窗口翻转，测试自动跳过小时增量校验（属预期行为，非失败）。
 - **stress-metrics 返回 success=false**：窗口内 consume 行数超过 50 万行护栏（`stressMaxRows`）。缩小窗口或加 `model_name` 过滤。
 - **stress-metrics 增量对不上（surplus > 0）**：该接口无 user_id 过滤，并发 glm-5.2 流量会混入增量。测试自动检测：干净环境精确匹配，有并发时自动切换为下界/子集校验（`delta >= 本次值`），F/G/H 始终精确。日志中会打印 `concurrent traffic detected: surplus=N`。
+- **stress-metrics schema 守卫失败**：`labels` 字符串或 counts 桶数与预期不符（后端改了直方图标签/桶数）。schema 守卫在 delta 计算前硬断言，定位明确。
 - **模型请求 4xx/5xx**：检查 `MODEL_BASE_URL` 与 `MODEL_API_KEY` 是否正确，网络是否可达。
 - **后台接口 401**：Cookie 失效或登录失败，检查 `ALAYA_ADMIN_*` 配置及后台可达性。
-- **缓存未命中**：确认同次运行内多次请求的 `system` 内容完全一致、`temperature=0`；注意每次运行前缀带唯一 `run-tag`，因此跨运行的缓存不会复用（这是设计使然：每次运行都独立验证"填缓存+命中"流程）。
-- **多次测试会互相影响吗**：不同运行因 `run-tag` 不同，使用不同缓存 key，互不干扰，每次都从冷缓存独立验证。同一运行内：第 1 轮第 1 次填缓存，其余命中；第 2 轮是否命中取决于缓存 TTL 是否 ≥ `INTER_ROUND_WAIT`（默认 120 秒）。
+- **缓存未命中**：确认第 1-2 轮每次请求的 `system` 内容完全一致（含 run-tag）、`temperature=0`；变长尾巴在 user 消息中（不影响前缀缓存）。第 3 轮无前缀故不命中（设计使然）。每次运行前缀带唯一 `run-tag`，跨运行的缓存不会复用。
+- **多次测试会互相影响吗**：不同运行因 `run-tag` 不同，使用不同缓存 key，互不干扰。同一运行内：第 1-2 轮固定前缀 → 命中；第 3 轮无前缀 → 不命中。第 2 轮是否命中前缀缓存取决于 TTL 是否 ≥ `INTER_ROUND_WAIT`（默认 120 秒）。
 - **报告未自动生成**：未安装 `allure` CLI（`npm i -g allure-commandline`，需 Java）。此时原始 JSON 仍会生成到 `reports/<run>/allure-results/`，可手动执行 `allure generate reports/<run>/allure-results -o reports/<run>/allure-report --clean`。设置 `ALAYA_SKIP_ALLURE_GEN=1` 可彻底跳过生成步骤。
 
 ## 注意事项
 
-- 测试会产生真实计费，`ALAYA_MAX_TOKENS` 默认设为 64 以控制输出成本，输入侧因需要长上下文仍会消耗较多 token。
+- 测试会产生真实计费。第 1-2 轮用 `ALAYA_MAX_TOKENS=64` 控制输出；但变长尾巴会覆盖到 50k-100k 输入桶（消耗显著），按需调整 `INPUT_BUCKET_TARGETS` 范围控制成本。第 3 轮输入/输出均随机 1-1k（成本较低）。
+- 第 1-2 轮缓存命中要求固定前缀（`ALAYA_PREFIX_TOKENS` 不宜改动）；变长尾巴在 user 消息中不影响前缀缓存。第 3 轮无前缀故完全未命中（验证非缓存场景）。
 - 登录 Cookie 在整个 session 内复用（session 级 fixture），不会重复登录。
 - `config.py` 中的明文凭据仅为测试环境默认值，生产环境请用环境变量覆盖，勿提交真实密钥到版本库。
 - 所有断言以 nexus `releases/xb01` 分支源码为口径基准，行号引用于各测试 docstring 与注释中。

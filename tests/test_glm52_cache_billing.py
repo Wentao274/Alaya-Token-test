@@ -1,8 +1,11 @@
 """GLM-5.2 cache-hit & billing correctness tests for user test01.
 
-Both tests depend on the session-scoped ``model_requests`` fixture which sends
-REQUEST_COUNT identical long-context requests (request #1 fills the prompt
-cache, the rest hit it) and then waits for the usage pipeline to propagate.
+Both tests depend on the session-scoped ``model_requests`` fixture: rounds 1-2
+send REQUEST_COUNT long-context requests each (fixed 3k prefix → cache hits,
+variable tail randomly assigned across 5 stress-metrics input buckets), then
+after a 2-min gap round 3 sends ROUND3_COUNT short independent requests (input/
+output 1-1k token, no shared prefix); the fixture then waits for the usage
+pipeline to propagate.
 
 Grounded in the nexus ``releases/xb01`` branch.
 
@@ -338,24 +341,35 @@ def _poll_log_stat(admin_client, baseline, our_request_count, win_start, win_end
     return last
 
 
-def _poll_stress_metrics(admin_client, baseline, our_request_count):
+def _poll_stress_metrics(admin_client, baseline, our_request_count, win_start, win_end):
     """Poll ``/api/admin/usage/stress-metrics`` until the n delta reflects our run.
 
     Returns the last raw stress-metrics response. ``baseline`` is the pre-run
-    snapshot (captured by ``model_requests`` over the page-default 近24小时
-    window). Each retry re-queries with a FRESH 近24小时 window
-    (``start = now - 86400``, ``end = int(time.time())`` — real-time at this
-    request, matching the page behavior). Polling succeeds once the
-    after-baseline ``n`` delta reaches our run's request count (all our consume
-    logs have landed). If ``our_request_count`` is 0, returns the first response.
+    snapshot (captured by ``model_requests`` over ``[win_start, now0]``). Both
+    ``win_start`` and ``win_end`` are the SHARED frozen page-default 近24小时
+    window: ``win_start`` was frozen at baseline (= now0 - 86400, stored as
+    ``model_requests["stress_window_start"]``), ``win_end`` was captured once
+    post-propagation (= now1, a real "now" > all this run's row created_at,
+    stored as ``model_requests["stress_query_end"]``). The window only grew at
+    the right edge vs baseline (same start), so (after - baseline) cancels all
+    pre-existing rows in their overlap exactly and equals the rows in
+    (now0, now1] (our run). Polling retries the SAME frozen query until our
+    consume logs have landed (their created_at < win_end, so once inserted they
+    appear in the window). Succeeds once the after-baseline ``n`` delta reaches
+    our run's request count. If ``our_request_count`` is 0, returns the first
+    response.
+
+    NOTE: a real-time sliding 24h window (``start = now_poll - 86400`` recomputed
+    per poll) would let the ~24h-ago segment fall out of the after window and
+    pollute the delta with negative counts (the delta_n=13<20 incident); the
+    frozen start is what makes the delta exact. Mirrors ``_poll_log_stat``.
     """
     last = None
     need = int(our_request_count)
     for attempt in range(1, config.POLL_RETRIES + 1):
-        q_start, q_end = config.last_24h_window()
         raw = admin_client.get_stress_metrics(
-            start_ts=q_start,
-            end_ts=q_end,
+            start_ts=win_start,
+            end_ts=win_end,
             model_name=config.MODEL_NAME,
         )
         last = raw
@@ -1969,15 +1983,21 @@ def test_stress_metrics(model_requests, admin_client):
         Upper-inclusive bounds; ``v>=10000`` is caught before the loop.
 
     The endpoint has no ``user_id``/``username`` filter (only ``model_name`` /
-    ``token_name``), so the test uses a baseline-delta (same idea as log-stat):
-    the baseline is captured BEFORE requests over the page-default 近24小时
-    window (``start = now0 - 86400``, ``end = now0``) with ``model_name=glm-5.2``
-    filter, and the after-snapshot uses the SAME format with its own real-time
-    ``end = now1``. Pre-existing glm-5.2 traffic in the 24h-overlap of the two
-    windows cancels in the delta; in a clean test environment (no concurrent
-    glm-5.2 traffic) the delta equals exactly this run. The ``model_name`` filter
-    narrows to glm-5.2 traffic and helps stay under the 500k-row guard
-    (``stressMaxRows``, ``stress_metrics.go:29``).
+    ``token_name``), so the test uses a baseline-delta (same idea as log-stat).
+    Because the endpoint filters rows by ``created_at BETWEEN start AND end``
+    (NOT date-keyed like daily-cost), baseline and after MUST share the SAME
+    frozen ``start`` for pre-existing traffic to cancel: the baseline is captured
+    BEFORE requests over the page-default 近24小时 window
+    (``start = now0 - 86400``, ``end = now0``) with ``model_name=glm-5.2`` filter,
+    and the after-snapshot reuses that SAME frozen ``start`` and advances ``end``
+    to a frozen post-propagation ``now1`` (captured once after PROPAGATION_WAIT,
+    > all this run's row created_at). With the shared start, (after - baseline) =
+    rows in (now0, now1] = exactly this run (mirrors test_log_stat_delta). A
+    real-time sliding 24h window (``start = now_poll - 86400`` recomputed per
+    poll) would let the ~24h-ago segment fall out of the after window and pollute
+    the delta with negative counts (the delta_n=13<20 incident). The
+    ``model_name`` filter narrows to glm-5.2 traffic and helps stay under the
+    500k-row guard (``stressMaxRows``, ``stress_metrics.go:29``).
 
     However, concurrent glm-5.2 traffic from OTHER users that lands BETWEEN
     the baseline and after snapshots appears in the delta (no user_id filter to
@@ -2014,7 +2034,11 @@ def test_stress_metrics(model_requests, admin_client):
         )
     b_start = model_requests["stress_window_start"]
     b_end = model_requests["stress_window_end"]
-    print(f"[stress] 基线快照: n={baseline['n']} (window [{b_start},{b_end}])")
+    q_end = model_requests["stress_query_end"]
+    print(
+        f"[stress] 基线快照: n={baseline['n']} (window [{b_start},{b_end}]); "
+        f"after window [{b_start},{q_end}] (shared frozen start)"
+    )
 
     usages = model_requests["usages"]
     our = sum_request_tokens(usages)
@@ -2048,11 +2072,17 @@ def test_stress_metrics(model_requests, admin_client):
         "预期分布(本次 usage 分桶)",
     )
 
-    # Poll until the after-snapshot's n delta reflects our run. Each poll uses a
-    # fresh page-default 近24小时 window (start = now - 86400, end = real-time
-    # now), matching the page behavior.
+    # Poll until the after-snapshot's n delta reflects our run. Uses the SHARED
+    # frozen window (start frozen at baseline = now0 - 86400, end frozen
+    # post-propagation = now1) so pre-existing glm-5.2 traffic in the overlap
+    # cancels and the delta equals exactly this run — mirroring the frozen-window
+    # pattern in test_log_stat_delta. Polling retries the SAME frozen query (not
+    # a real-time sliding 24h window, which would let the ~24h-ago segment fall
+    # out of the after window and pollute the delta with negative counts).
     with allure.step("查询 stress-metrics 并轮询至本次数据就绪"):
-        raw = _poll_stress_metrics(admin_client, baseline, our["request_count"])
+        raw = _poll_stress_metrics(
+            admin_client, baseline, our["request_count"], b_start, q_end
+        )
     print(f"[admin] stress-metrics raw (after): {raw}")
     attach_json(raw, "stress-metrics 原始响应(请求后)")
 
@@ -2075,6 +2105,80 @@ def test_stress_metrics(model_requests, admin_client):
     )
     assert after is not None
     attach_json(after, "stress-metrics 快照(请求后)")
+
+    # Schema guard: verify the interface-returned histogram labels and bucket
+    # counts match the hardcoded constants used by the delta math and the D/E
+    # assertions below. Those computations rely on ``zip(IN_HIST_LABELS,
+    # delta_in_hist)`` aligning label-by-count; if the backend changes a label
+    # string (e.g. ">100k" → ">100000") or the bucket count (9 → 8/10), ``zip``
+    # would silently misalign/truncate and the histogram checks could pass
+    # against the wrong mapping. Asserting the schema explicitly surfaces such
+    # drift as a clear, localized failure before the delta math runs.
+    with allure.step("直方图 schema 校验: labels / 桶数"):
+        _check(
+            "after in_hist.labels == 预期输入分桶标签",
+            expected=IN_HIST_LABELS,
+            actual=after["in_hist_labels"],
+            passed=after["in_hist_labels"] == IN_HIST_LABELS,
+            detail=(
+                f"after in_hist.labels={after['in_hist_labels']} != "
+                f"expected={IN_HIST_LABELS}"
+            ),
+        )
+        _check(
+            "after out_hist.labels == 预期输出分桶标签",
+            expected=OUT_HIST_LABELS,
+            actual=after["out_hist_labels"],
+            passed=after["out_hist_labels"] == OUT_HIST_LABELS,
+            detail=(
+                f"after out_hist.labels={after['out_hist_labels']} != "
+                f"expected={OUT_HIST_LABELS}"
+            ),
+        )
+        _check(
+            "after in_hist.counts 桶数 == 9",
+            expected=len(IN_HIST_LABELS),
+            actual=len(after["in_hist_counts"]),
+            passed=len(after["in_hist_counts"]) == len(IN_HIST_LABELS),
+            detail=(
+                f"after in_hist.counts length={len(after['in_hist_counts'])} != "
+                f"expected={len(IN_HIST_LABELS)}"
+            ),
+        )
+        _check(
+            "after out_hist.counts 桶数 == 9",
+            expected=len(OUT_HIST_LABELS),
+            actual=len(after["out_hist_counts"]),
+            passed=len(after["out_hist_counts"]) == len(OUT_HIST_LABELS),
+            detail=(
+                f"after out_hist.counts length={len(after['out_hist_counts'])} != "
+                f"expected={len(OUT_HIST_LABELS)}"
+            ),
+        )
+        # Baseline must share the same schema, otherwise the element-wise delta
+        # (after - baseline) is meaningless.
+        _check(
+            "baseline in_hist.counts 桶数 == 9",
+            expected=len(IN_HIST_LABELS),
+            actual=len(baseline["in_hist_counts"]),
+            passed=len(baseline["in_hist_counts"]) == len(IN_HIST_LABELS),
+            detail=(
+                f"baseline in_hist.counts length="
+                f"{len(baseline['in_hist_counts'])} != "
+                f"expected={len(IN_HIST_LABELS)}"
+            ),
+        )
+        _check(
+            "baseline out_hist.counts 桶数 == 9",
+            expected=len(OUT_HIST_LABELS),
+            actual=len(baseline["out_hist_counts"]),
+            passed=len(baseline["out_hist_counts"]) == len(OUT_HIST_LABELS),
+            detail=(
+                f"baseline out_hist.counts length="
+                f"{len(baseline['out_hist_counts'])} != "
+                f"expected={len(OUT_HIST_LABELS)}"
+            ),
+        )
 
     # Compute deltas (fixed window → pre-existing traffic cancels).
     delta_n = after["n"] - baseline["n"]

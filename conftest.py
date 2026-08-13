@@ -4,9 +4,12 @@ Session-scoped fixtures:
 
 * ``admin_client``   - logs into the operation platform once and reuses the cookie.
 * ``model_client``   - the OpenAI-compatible client used by test01.
-* ``model_requests`` - sends REQUEST_COUNT identical long-context requests so
-  that request #1 fills the prompt cache and the rest hit it, then waits for
-  the usage pipeline to propagate before the assertion tests run.
+* ``model_requests`` - sends ROUND_COUNT rounds of REQUEST_COUNT long-context
+  requests (fixed system prefix 3k → cache hits, variable tail per request
+  randomly assigned across 5 stress-metrics input buckets 1k-5k..50k-100k), then
+  after a ROUND2_TO_ROUND3_WAIT gap sends a round 3 of ROUND3_COUNT short
+  independent requests (no shared prefix, input/output 1-1k token), then waits
+  for the usage pipeline to propagate before the assertion tests run.
 
 Allure integration:
 * Each model request is recorded as a step with its usage + raw response.
@@ -21,6 +24,7 @@ Allure integration:
 """
 
 import os
+import random
 import shutil
 import subprocess
 import time
@@ -31,7 +35,10 @@ import pytest
 import config
 from clients.admin_client import AdminClient
 from clients.model_client import ModelClient
-from data.long_context import build_long_context
+from data.long_context import (
+    build_long_context,
+    build_variable_tail,
+)
 from data.metrics import (
     cached_of,
     extract_log_stat,
@@ -240,38 +247,72 @@ def model_requests(model_client, admin_client):
     prefix = build_long_context(approx_tokens=config.PREFIX_TOKENS, tag=tag)
     print(
         f"[model] run_tag={tag} prefix_chars={len(prefix)} "
-        f"(~{config.PREFIX_TOKENS} tokens target); "
-        f"{config.ROUND_COUNT} rounds x {config.REQUEST_COUNT} reqs"
+        f"(~{config.PREFIX_TOKENS} tokens, fixed → cached); "
+        f"{config.ROUND_COUNT} rounds x {config.REQUEST_COUNT} long-ctx reqs "
+        f"(5 input buckets) + round 3 x {config.ROUND3_COUNT} short-ctx reqs "
+        f"(input 1-{config.ROUND3_MAX_INPUT_TOKENS}t, "
+        f"output 1-{config.ROUND3_MAX_OUTPUT_TOKENS}t)"
     )
 
-    # Identical messages on every call => identical prefix => cache hits after #1.
-    messages = [
-        {"role": "system", "content": prefix},
-        {"role": "user", "content": "请用一句话概括上文的核心观点。"},
-    ]
-    request_payload = {
-        "model": config.MODEL_NAME,
-        "max_tokens": config.MAX_TOKENS,
-        "temperature": 0.0,
-        "messages": [
-            {"role": "system", "content": f"<long prefix, {len(prefix)} chars>"},
-            {"role": "user", "content": messages[1]["content"]},
-        ],
-    }
+    base_question = "请用一句话概括上文的核心观点。"
 
     usages = []
     request_points = []  # (completion_unix_ts, usage_dict) per request
     rounds = []  # per-round summary dicts
     req_index = 0
     window_start = time.time()
+
+    # Rounds 1-2: long-context, bucket-assigned. Fixed system prefix (built once
+    # above) → identical prefix → cache hits after request #1. A variable tail
+    # (in the user message, after the cached prefix) makes total prompt_tokens
+    # fall in the assigned bucket; tail = bucket_target - PREFIX_TOKENS.
+    # Build a shuffled bucket assignment so all 5 input buckets get ~equal
+    # coverage (each bucket repeated N//5 times, then shuffled).
+    total_long = config.ROUND_COUNT * config.REQUEST_COUNT
+    per_bucket = total_long // len(config.INPUT_BUCKET_TARGETS)
+    remainder = total_long % len(config.INPUT_BUCKET_TARGETS)
+    bucket_assignment = []
+    for idx, bucket in enumerate(config.INPUT_BUCKET_TARGETS):
+        count = per_bucket + (1 if idx < remainder else 0)
+        bucket_assignment.extend([bucket] * count)
+    random.shuffle(bucket_assignment)
+
     for round_idx in range(1, config.ROUND_COUNT + 1):
         round_usages = []
         round_start_ts = None
         round_end_ts = None
         with allure.step(
-            f"第 {round_idx}/{config.ROUND_COUNT} 轮: 发起 {config.REQUEST_COUNT} 次模型请求"
+            f"第 {round_idx}/{config.ROUND_COUNT} 轮: 发起 {config.REQUEST_COUNT} 次长上下文请求"
         ):
             for i in range(config.REQUEST_COUNT):
+                bucket_label, b_lo, b_hi = bucket_assignment[req_index]
+                tail_tokens = random.randint(
+                    max(0, b_lo - config.PREFIX_TOKENS),
+                    b_hi - config.PREFIX_TOKENS,
+                )
+                tail = build_variable_tail(tail_tokens, seed=f"r{round_idx}q{i + 1}")
+                user_content = base_question
+                if tail:
+                    user_content = f"{base_question}\n\n{tail}"
+                messages = [
+                    {"role": "system", "content": prefix},
+                    {"role": "user", "content": user_content},
+                ]
+                request_payload = {
+                    "model": config.MODEL_NAME,
+                    "max_tokens": config.MAX_TOKENS,
+                    "temperature": 0.0,
+                    "messages": [
+                        {
+                            "role": "system",
+                            "content": f"<prefix ~{config.PREFIX_TOKENS}t, {len(prefix)} chars>",
+                        },
+                        {
+                            "role": "user",
+                            "content": f"<user msg, {len(user_content)} chars (~{tail_tokens} tail t)>",
+                        },
+                    ],
+                }
                 result = model_client.chat(
                     messages,
                     model=config.MODEL_NAME,
@@ -293,7 +334,8 @@ def model_requests(model_client, admin_client):
                     detail = "<no usage>"
                 print(
                     f"[model] round{round_idx} req#{i + 1}/{config.REQUEST_COUNT} "
-                    f"(#{req_index} total) @ts={done_ts}: {detail}"
+                    f"(#{req_index}) bucket={bucket_label} "
+                    f"prefix={config.PREFIX_TOKENS}t tail={tail_tokens}t @ts={done_ts}: {detail}"
                 )
                 record_model_call(
                     req_index,
@@ -313,16 +355,95 @@ def model_requests(model_client, admin_client):
             }
         )
 
-        # Wait between rounds (not after the last one).
         if round_idx < config.ROUND_COUNT and config.INTER_ROUND_WAIT > 0:
             print(
                 f"[model] round {round_idx} done; waiting {config.INTER_ROUND_WAIT}s "
-                f"before round {round_idx + 1} (cache-persistence gap)..."
+                f"before round {round_idx + 1}..."
             )
-            with allure.step(
-                f"轮次间隔: 等待 {config.INTER_ROUND_WAIT}s (测试缓存跨轮持久化)"
-            ):
+            with allure.step(f"轮次间隔: 等待 {config.INTER_ROUND_WAIT}s"):
                 time.sleep(config.INTER_ROUND_WAIT)
+
+    # Wait between round 2 (last long-context) and round 3 (short-context).
+    if config.ROUND2_TO_ROUND3_WAIT > 0:
+        print(
+            f"[model] long-context rounds done; waiting "
+            f"{config.ROUND2_TO_ROUND3_WAIT}s before round 3 (short-context)..."
+        )
+        with allure.step(
+            f"等待 {config.ROUND2_TO_ROUND3_WAIT}s 后开始第三轮短上下文请求"
+        ):
+            time.sleep(config.ROUND2_TO_ROUND3_WAIT)
+
+    # Round 3: short independent requests (no shared prefix, input/output 1-1k).
+    round3_usages = []
+    round3_start_ts = None
+    round3_end_ts = None
+    with allure.step(
+        f"第 3 轮: 发起 {config.ROUND3_COUNT} 次短上下文请求 (输入/输出 1-1k token)"
+    ):
+        for i in range(config.ROUND3_COUNT):
+            input_tokens = random.randint(
+                config.ROUND3_MIN_INPUT_TOKENS, config.ROUND3_MAX_INPUT_TOKENS
+            )
+            content = build_variable_tail(input_tokens, seed=f"r3q{i + 1}")
+            user_content = f"请简要阐述以下文本的核心要点：\n\n{content}"
+            max_tok = random.randint(
+                config.ROUND3_MIN_OUTPUT_TOKENS, config.ROUND3_MAX_OUTPUT_TOKENS
+            )
+            messages = [{"role": "user", "content": user_content}]
+            request_payload = {
+                "model": config.MODEL_NAME,
+                "max_tokens": max_tok,
+                "temperature": 0.0,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": f"<user msg, {len(user_content)} chars"
+                        f" (~{input_tokens} input t), max_tokens={max_tok}>",
+                    },
+                ],
+            }
+            result = model_client.chat(
+                messages,
+                model=config.MODEL_NAME,
+                max_tokens=max_tok,
+                temperature=0.0,
+            )
+            done_ts = int(time.time())
+            usage = result.get("usage", {})
+            usages.append(usage)
+            round3_usages.append(usage)
+            request_points.append((done_ts, usage))
+            req_index += 1
+            if round3_start_ts is None:
+                round3_start_ts = done_ts
+            round3_end_ts = done_ts
+            if usage:
+                detail = ", ".join(f"{k}={v}" for k, v in usage.items())
+            else:
+                detail = "<no usage>"
+            print(
+                f"[model] round3 req#{i + 1}/{config.ROUND3_COUNT} "
+                f"(#{req_index}) input~{input_tokens}t max={max_tok}t "
+                f"@ts={done_ts}: {detail}"
+            )
+            record_model_call(
+                req_index,
+                config.MODEL_NAME,
+                usage,
+                done_ts,
+                request_payload,
+                result,
+            )
+            time.sleep(config.REQUEST_PACING)
+    rounds.append(
+        {
+            "round": 3,
+            "start_ts": round3_start_ts,
+            "end_ts": round3_end_ts,
+            "usages": round3_usages,
+        }
+    )
     window_end = int(time.time())
 
     # Cache-hit summary across all requests.  Some usages carry
@@ -335,8 +456,10 @@ def model_requests(model_client, admin_client):
     completion_total = sum(int(u.get("completion_tokens") or 0) for u in usages)
     allure.attach(
         f"run_tag={tag}\n"
-        f"rounds={config.ROUND_COUNT} x {config.REQUEST_COUNT} = {len(usages)} requests\n"
-        f"inter_round_wait={config.INTER_ROUND_WAIT}s\n"
+        f"rounds: {config.ROUND_COUNT} x {config.REQUEST_COUNT} (long-ctx) "
+        f"+ 1 x {config.ROUND3_COUNT} (short-ctx) = {len(usages)} requests\n"
+        f"inter_round_wait={config.INTER_ROUND_WAIT}s, "
+        f"round2→3 wait={config.ROUND2_TO_ROUND3_WAIT}s\n"
         f"window=[{int(window_start)}..{window_end}] ({window_end - int(window_start)}s)\n"
         f"prompt_tokens_sum={uncached_total}\n"
         f"cached_input_tokens_sum={cached}\n"
@@ -374,6 +497,21 @@ def model_requests(model_client, admin_client):
     # always inside the window).
     page_end_24h = int(time.time())
     page_start_24h = page_end_24h - 86400
+
+    # Shared frozen query window for the stress-metrics baseline-delta
+    # (test_stress_metrics). The endpoint filters rows by ``created_at BETWEEN
+    # start AND end`` (like /api/log/stat, NOT date-keyed like daily-cost), so
+    # baseline and after MUST share the SAME frozen ``start`` to cancel
+    # pre-existing glm-5.2 traffic in their overlap. ``stress_window_start`` was
+    # frozen at baseline (= now0 - 86400, captured above); the after-snapshot
+    # advances ``end`` to this frozen post-propagation ``now1`` (captured here,
+    # once, > all this run's row created_at). With the shared start, (after -
+    # baseline) = rows in (now0, now1] = exactly this run (mirrors
+    # test_log_stat_delta's frozen-window pattern, conftest.py:160-166). A
+    # real-time sliding 24h window (start = now_poll - 86400 recomputed per poll)
+    # would let the ~24h-ago segment fall out of the after window and pollute the
+    # delta with negative counts (the delta_n=13<20 incident).
+    stress_query_end = int(time.time())
     return {
         "usages": usages,
         "request_points": request_points,
@@ -396,6 +534,7 @@ def model_requests(model_client, admin_client):
         "stress_baseline": stress_baseline,
         "stress_window_start": stress_window_start,
         "stress_window_end": stress_window_end,
+        "stress_query_end": stress_query_end,  # frozen post-propagation end (now1) for the after-snapshot; shares the frozen stress_window_start so the delta cancels pre-existing traffic
     }
 
 
