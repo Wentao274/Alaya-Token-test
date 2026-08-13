@@ -12,7 +12,8 @@ alaya-token-test/
 ├── pytest.ini                    # pytest 配置（pythonpath=.、testpaths、日志）
 ├── run.py                         # 运行入口：时间戳分目录 + 转发参数到 pytest
 ├── config.py                     # 全部配置项，支持 ALAYA_* 环境变量覆盖
-├── conftest.py                   # session 级 fixture + 4 个基线快照 + Allure 报告自动生成
+├── conftest.py                   # session 级 fixture + 4 个基线快照（报告生成已移至 run.py）
+├── run.py                        # 运行入口：时间戳分目录 + 转发参数给 pytest + 子进程退出后生成 allure 报告
 ├── clients/
 │   ├── admin_client.py           # 运营后台：登录 + tpm-capacity/daily-cost/cache-optimize/log/stat/stress-metrics
 │   └── model_client.py           # 模型侧：OpenAI 兼容 /v1/chat/completions
@@ -520,7 +521,9 @@ test01 无优化 → billed==real → `granted=0` 每请求 → `ctr_granted` �
 
 1. **创建本次运行目录** `reports/<YYYYMMDD-HHMMSS>/`（默认时间戳，可用 `ALAYA_RUN_DIR` 自定义），多次运行互不覆盖；
 2. **记录原始结果**到 `reports/<run>/allure-results/`（由 `run.py` 动态传 `--alluredir`）；
-3. **生成 HTML 报告**到 `reports/<run>/allure-report/index.html`（由 `conftest.py` 的 session 级 fixture `generate_allure_report` 在全部用例结束后调用 `allure generate`，通过 `ALAYA_RUN_DIR` 与 `run.py` 解析到同一目录）。
+3. **生成 HTML 报告**到 `reports/<run>/allure-report/index.html`：由 `run.py` 在 **pytest 子进程退出后** 调用 `allure generate`（而非在 pytest 进程内的 session fixture 中生成）。
+
+> **为何在子进程退出后生成？** 此前由 `conftest.py` 的 session 级 fixture 在会话结束时（pytest 进程内）调用 `allure generate`，与 allure-pytest 写入最后一个测试的 `result.json` 存在竞态：fixture teardown 运行 `allure generate` 时最后一个测试的 result 文件还未刷盘，导致报告里**缺少最后一个用例**（曾出现 stress-metrics 用例通过但报告只显示 5 个）。改为子进程退出后生成，保证所有 result 文件已落盘，彻底消除该竞态。
 
 报告里记录的内容：
 
@@ -573,6 +576,7 @@ allure serve reports/<run>/allure-results
 - **缓存未命中**：确认第 1-2 轮每次请求的 `system` 内容完全一致（含 run-tag）、`temperature=0`；变长尾巴在 user 消息中（不影响前缀缓存）。第 3 轮无前缀故不命中（设计使然）。每次运行前缀带唯一 `run-tag`，跨运行的缓存不会复用。
 - **多次测试会互相影响吗**：不同运行因 `run-tag` 不同，使用不同缓存 key，互不干扰。同一运行内：第 1-2 轮固定前缀 → 命中；第 3 轮无前缀 → 不命中。第 2 轮是否命中前缀缓存取决于 TTL 是否 ≥ `INTER_ROUND_WAIT`（默认 120 秒）。
 - **报告未自动生成**：未安装 `allure` CLI（`npm i -g allure-commandline`，需 Java）。此时原始 JSON 仍会生成到 `reports/<run>/allure-results/`，可手动执行 `allure generate reports/<run>/allure-results -o reports/<run>/allure-report --clean`。设置 `ALAYA_SKIP_ALLURE_GEN=1` 可彻底跳过生成步骤。
+- **报告缺少最后一个用例**：早期版本由 conftest 的 session fixture 在 pytest 进程内生成报告，与 allure-pytest 写最后一个测试的 result.json 竞态导致最后一个用例丢失。已改为 `run.py` 在 pytest 子进程退出后生成（保证 result 文件已落盘）。若仍出现，确认使用的是最新 `run.py` 而非直接 `pytest`。
 
 ## 注意事项
 
